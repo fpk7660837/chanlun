@@ -638,7 +638,7 @@ class CL:
             klines.append(k)
 
         cl_klines = self.klines_baohan(klines, up_cl_klines)
-        if (len(cl_klines) >= 2 and cl_kline_2) or (len(cl_klines) == 1 and cl_kline_2):
+        if len(cl_klines) >= 1 and cl_kline_2:
             # 重新给缠论k线附新值
             cl_kline_2.k_index = cl_klines[0].k_index
             cl_kline_2.date = cl_klines[0].date
