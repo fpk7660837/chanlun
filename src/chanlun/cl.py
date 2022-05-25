@@ -13,13 +13,13 @@ class Kline:
     """
 
     def __init__(self, index: int, date: datetime, h: float, l: float, o: float, c: float, a: float):
-        self.index: int = index
-        self.date: datetime = date
-        self.h: float = h
-        self.l: float = l
-        self.o: float = o
-        self.c: float = c
-        self.a: float = a
+        self.index: int = index # 索引编号
+        self.date: datetime = date # K线日期
+        self.h: float = h # 高点
+        self.l: float = l # 低点
+        self.o: float = o # 开盘价
+        self.c: float = c # 收盘价
+        self.a: float = a # 成交量
 
     def __str__(self):
         return "index: %s date: %s h: %s l: %s o: %s c:%s a:%s" % \
@@ -33,16 +33,16 @@ class CLKline:
 
     def __init__(self, k_index: int, date: datetime, h: float, l: float, o: float, c: float, a: float,
                  klines: List[Kline] = [], index: int = 0, _n: int = 0, _q: bool = False):
-        self.k_index: int = k_index
-        self.date: datetime = date
-        self.h: float = h
-        self.l: float = l
-        self.o: float = o
-        self.c: float = c
-        self.a: float = a
+        self.k_index: int = k_index # K线的索引编号，对应上面的Kline的index
+        self.date: datetime = date # 日期
+        self.h: float = h # 高点
+        self.l: float = l # 低点
+        self.o: float = o # 开盘价
+        self.c: float = c # 收盘价
+        self.a: float = a # 成交量
         self.klines: List[Kline] = klines  # 其中包含K线对象
-        self.index: int = index
-        self.n: int = _n  # 记录包含的K线数量
+        self.index: int = index # 缠论K线的索引编号
+        self.n: int = _n  # 记录包含的K线数量= self.klines.length
         self.q: bool = _q  # 是否有缺口
         self.up_qs = None  # 合并时之前的趋势
 
@@ -61,7 +61,7 @@ class FX:
         self.type: str = _type  # 分型类型 （ding 顶分型 di 底分型）
         self.k: CLKline = k
         self.klines: List[CLKline] = klines
-        self.val: float = val
+        self.val: float = val  # 分型高低点
         self.index: int = index
         self.tk: bool = tk  # 记录是否跳空
         self.real: bool = real  # 是否是有效的分型
@@ -298,7 +298,7 @@ class XLFX:
         self.type = _type
         self.high = high
         self.low = low
-        self.line = line
+        self.line = line  # why 这个线指的是啥？
 
         self.qk = qk  # 分型是否有缺口
         self.line_bad = line_bad  # 标记是否线破坏
@@ -877,28 +877,28 @@ class CL:
         """
         is_update = False
         if base_line_type == 'bi':
-            up_lines = self.xds
+            advance_lines = self.xds  # 如果基线是笔，那么高级的就是线段
             base_lines = self.bis
         elif base_line_type == 'xd':
-            up_lines = self.qss
+            advance_lines = self.qss  # 如果基线是线段，那么高级的就是趋势
             base_lines = self.xds
         else:
             raise ('处理高级别线段类型错误：%s' % base_line_type)
 
-        if len(base_lines) == 0:
+        if len(base_lines) == 0:  # 没有数据就直接返回
             return False
 
-        if len(up_lines) == 0:
-            bi_0 = base_lines[0]
+        if len(advance_lines) == 0:
+            bi_0 = base_lines[0]  # 第一笔
             start_fx = XLFX(
-                _type='di' if bi_0.type == 'up' else 'ding',
+                _type='di' if bi_0.type == 'up' else 'ding',  # 如果第一笔是向上笔，那么开始的分型就是底分型，因为向上笔会在序列分型的顶分型处结束
                 high=bi_0.high,
                 low=bi_0.low,
                 line=bi_0
             )
             end_fx = None
 
-            if start_fx.type == 'di':
+            if start_fx.type == 'di':  # 如果开始的分型是底分型
                 # 有相同类型 序列分型，用最新的
                 dis = self.cal_line_xlfx(base_lines, 'di')
                 for di in dis:
@@ -937,51 +937,51 @@ class CL:
                 )
                 self.process_line_ld(new_up_line)
                 self.process_line_hl(new_up_line)
-                up_lines.append(new_up_line)
+                advance_lines.append(new_up_line)
                 return True
             else:
                 return False
 
-        up_line = up_lines[-1]
+        advance_line = advance_lines[-1]  # 最近的一个高级线，比如线段，趋势
 
         # 先检查是否有延续的 顶底分型
-        if up_line.type == 'up':
-            dings = self.cal_line_xlfx(base_lines[up_line.start_line.index:], 'ding')
+        if advance_line.type == 'up':
+            dings = self.cal_line_xlfx(base_lines[advance_line.start_line.index:], 'ding')
             # 上一个线段是向上的，之后又出现了顶分型，进行线段的修正
             for ding in dings:
-                if ding.line.index >= up_line.end_line.index:
+                if ding.line.index >= advance_line.end_line.index:
                     end_line = base_lines[ding.line.index - 1]
-                    up_line.end = end_line.end
-                    up_line.end_line = end_line
-                    up_line.ding_fx = ding
-                    up_line.done = ding.done
-                    self.process_line_ld(up_line)
-                    self.process_line_hl(up_line)
+                    advance_line.end = end_line.end
+                    advance_line.end_line = end_line
+                    advance_line.ding_fx = ding
+                    advance_line.done = ding.done
+                    self.process_line_ld(advance_line)
+                    self.process_line_hl(advance_line)
                     is_update = True
-        elif up_line.type == 'down':
-            dis = self.cal_line_xlfx(base_lines[up_line.start_line.index:], 'di')
+        elif advance_line.type == 'down':
+            dis = self.cal_line_xlfx(base_lines[advance_line.start_line.index:], 'di')
             # 上一个线段是向下的，之后有出现了底分型，进行线段的修正
             for di in dis:
-                if di.line.index >= up_line.end_line.index:
+                if di.line.index >= advance_line.end_line.index:
                     end_line = base_lines[di.line.index - 1]
-                    up_line.end = end_line.end
-                    up_line.end_line = end_line
-                    up_line.di_fx = di
-                    up_line.done = di.done
-                    self.process_line_ld(up_line)
-                    self.process_line_hl(up_line)
+                    advance_line.end = end_line.end
+                    advance_line.end_line = end_line
+                    advance_line.di_fx = di
+                    advance_line.done = di.done
+                    self.process_line_ld(advance_line)
+                    self.process_line_hl(advance_line)
                     is_update = True
 
         # 在检查后续是否有相反的分型，形成新的线段
-        if up_line.type == 'up':
+        if advance_line.type == 'up':
             # 上一个线段是向上的，找底分型
-            dis = self.cal_line_xlfx(base_lines[up_line.end_line.index + 1:], 'di')
+            dis = self.cal_line_xlfx(base_lines[advance_line.end_line.index + 1:], 'di')
             for di in dis:
-                if di.line.index - up_line.end_line.index >= 2:  # and di.low < up_xd.high:
+                if di.line.index - advance_line.end_line.index >= 2:  # and di.low < up_xd.high:
                     # 判断第二种情况，有缺口，后续的分型继续 跌破/突破 前高/前低
                     # if up_xd.ding_fx.qk and up_xd.ding_fx.fx_high < di.fx_high:
                     #     continue
-                    start_line = base_lines[up_line.end_line.index + 1]
+                    start_line = base_lines[advance_line.end_line.index + 1]
                     end_line = base_lines[di.line.index - 1]
                     new_up_line = XD(
                         start=start_line.start,
@@ -989,27 +989,27 @@ class CL:
                         start_line=start_line,
                         end_line=end_line,
                         _type='down',
-                        index=up_line.index + 1,
-                        ding_fx=up_line.ding_fx,
+                        index=advance_line.index + 1,
+                        ding_fx=advance_line.ding_fx,
                         di_fx=di,
                         done=di.done
                     )
                     self.process_line_ld(new_up_line)
                     self.process_line_hl(new_up_line)
                     # 将上一个线段标记为完成，TODO 在特殊情况 会有两个顶底未完成的情况（SZ.000685 日线）
-                    up_line.done = True
-                    up_lines.append(new_up_line)
+                    advance_line.done = True
+                    advance_lines.append(new_up_line)
                     is_update = True
                     break
-        elif up_line.type == 'down':
+        elif advance_line.type == 'down':
             # 上一个线段是向下的，找顶分型
-            dings = self.cal_line_xlfx(base_lines[up_line.end_line.index + 1:], 'ding')
+            dings = self.cal_line_xlfx(base_lines[advance_line.end_line.index + 1:], 'ding')
             for ding in dings:
-                if ding.line.index - up_line.end_line.index >= 2:  # and ding.high > up_xd.low:
+                if ding.line.index - advance_line.end_line.index >= 2:  # and ding.high > up_xd.low:
                     # 判断第二种情况，有缺口，后续的分型继续 跌破/突破 前高/前低
                     # if up_xd.di_fx.qk and up_xd.di_fx.fx_low > ding.fx_low:
                     #     continue
-                    start_line = base_lines[up_line.end_line.index + 1]
+                    start_line = base_lines[advance_line.end_line.index + 1]
                     end_line = base_lines[ding.line.index - 1]
                     new_up_line = XD(
                         start=start_line.start,
@@ -1017,16 +1017,16 @@ class CL:
                         start_line=start_line,
                         end_line=end_line,
                         _type='up',
-                        index=up_line.index + 1,
+                        index=advance_line.index + 1,
                         ding_fx=ding,
-                        di_fx=up_line.di_fx,
+                        di_fx=advance_line.di_fx,
                         done=ding.done
                     )
                     self.process_line_ld(new_up_line)
                     self.process_line_hl(new_up_line)
                     # 将上一个线段标记为完成，TODO 在特殊情况 会有两个顶底未完成的情况（SZ.000685 日线）
-                    up_line.done = True
-                    up_lines.append(new_up_line)
+                    advance_line.done = True
+                    advance_lines.append(new_up_line)
                     is_update = True
                     break
 
@@ -1546,7 +1546,7 @@ class CL:
                 qs = 'up' if fx_type == 'ding' else 'down'
                 up_xl = xulie[-1]
 
-                if up_xl['max'] >= now_xl['max'] and up_xl['min'] <= now_xl['min']:
+                if up_xl['max'] >= now_xl['max'] and up_xl['min'] <= now_xl['min']:  # 这里是up包含now
                     if qs == 'up':
                         now_xl['line'] = now_xl['line'] if now_xl['max'] >= up_xl['max'] else up_xl['line']
                         now_xl['max'] = max(up_xl['max'], now_xl['max'])
@@ -1556,9 +1556,9 @@ class CL:
                         now_xl['max'] = min(up_xl['max'], now_xl['max'])
                         now_xl['min'] = min(up_xl['min'], now_xl['min'])
 
-                    del (xulie[-1])
+                    del (xulie[-1])  # 删除前一个序列，为什么那
                     xulie.append(now_xl)
-                elif up_xl['max'] < now_xl['max'] and up_xl['min'] > now_xl['min']:
+                elif up_xl['max'] < now_xl['max'] and up_xl['min'] > now_xl['min']:  # 这里是up被now包含
                     # 强包含，之后的特征序列包含前面的，形成强转折，这时不处理包含关系，同时也形成了笔破坏
                     now_xl['line_bad'] = True
                     xulie.append(now_xl)
