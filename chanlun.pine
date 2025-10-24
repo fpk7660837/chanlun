@@ -1,0 +1,142 @@
+//@version=6
+// --- 核心修改 ---
+// 1. 增加了 input.string 来让用户选择画笔算法。
+// 2. 修改了画笔的成立条件，使用 if/else 结构来应用不同的算法逻辑。
+// 3. 将原有的严格画笔逻辑归为“新笔/严格笔”，并新增了“老笔”的逻辑。
+indicator('缠论自动画笔 (Chanlun Strokes) [新老笔修正版]', '缠论笔 v4', overlay = true)
+
+// --- 常量和输入 ---
+TOP_COLOR = color.new(color.red, 0)
+BOT_COLOR = color.new(color.green, 0)
+PEN_WIDTH = 2
+
+// --- 新增输入：画笔算法选择 ---
+pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'], tooltip = '老笔：顶底分型之间至少有1根独立K线。\n新笔/严格笔：顶底分型的K线区间不允许重叠。')
+
+// --- 类型定义 ---
+type Kx // 处理后的K线
+	float high
+	float low
+	int time
+	int index // 记录它在kx_array中的索引，便于计算距离
+
+type Fx // 分型
+	float price // 分型的极值价格
+	float fx_high // 构成该分型的K线的最高价
+	float fx_low // 构成该分型的K线的最低价
+	int time
+	int type // 1 for Top, -1 for Bottom
+	label label_id // 存储与该分型关联的标签ID
+	int kx_index // 记录该分型中心K线在kx_array中的索引
+
+// --- 变量初始化 ---
+var kx_array = array.new<Kx>()
+var pen_fractals = array.new<Fx>()
+var pen_lines = array.new<line>()
+var Kx current_kx = na
+
+// --- 主逻辑 ---
+
+// 1. K线包含关系处理
+if na(current_kx)
+    current_kx := Kx.new(high, low, time, -1)
+    current_kx
+else
+    h = current_kx.high
+    l = current_kx.low
+    is_merged = false
+
+    // 包含关系判断
+    if high >= h and low <= l or high <= h and low >= l
+        is_merged := true
+
+        // 合并K线（根据方向决定保留最高高点还是最低低点）
+        // 这里简化为只合并价格范围
+        current_kx.high := math.max(high, h)
+        current_kx.low := math.min(low, l)
+        current_kx.time := time
+        current_kx.time
+
+    if not is_merged
+        // 存储处理完的K线，并赋予其在数组中的索引
+        current_kx.index := array.size(kx_array)
+        array.push(kx_array, current_kx)
+
+        // 2. 检查是否形成分型
+        if array.size(kx_array) >= 3
+            k1 = array.get(kx_array, array.size(kx_array) - 3)
+            k2 = array.get(kx_array, array.size(kx_array) - 2)
+            k3 = array.get(kx_array, array.size(kx_array) - 1)
+
+            // 标准分型判断
+            is_top = k2.high > k1.high and k2.high > k3.high and k2.low > k1.low and k2.low > k3.low
+            is_bot = k2.low < k1.low and k2.low < k3.low and k2.high < k1.high and k2.high < k3.high
+
+            if is_top or is_bot
+                new_fx_price = is_top ? k2.high : k2.low
+                new_fx_time = k2.time
+                new_fx_type = is_top ? 1 : -1
+                new_fx_kx_index = k2.index // 获取分型中心K的索引
+
+                // 3. 处理分型，形成或更新笔
+                if array.size(pen_fractals) == 0
+                    // 第一个分型
+                    new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                    array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
+                else
+                    last_fx = array.last(pen_fractals)
+
+                    // 情况A: 新分型与上一个类型不同 -> 尝试形成新笔
+                    if new_fx_type != last_fx.type
+
+                        // --- 关键修正：根据用户选择的算法判断笔是否成立 ---
+                        bool is_valid_pen_formation = false
+
+                        if pen_algo == '新笔/严格笔'
+                            // **新笔/严格笔 算法**：检查价格区间的严格分离
+                            if new_fx_type == 1 // 新顶，旧底（向上笔）
+                                if k2.low > last_fx.fx_high // 顶分型低点 > 底分型高点
+                                    is_valid_pen_formation := true
+                                    is_valid_pen_formation
+                            else // 新底，旧顶（向下笔）
+                                if k2.high < last_fx.fx_low // 底分型高点 < 顶分型低点
+                                    is_valid_pen_formation := true
+                                    is_valid_pen_formation
+
+                        else if pen_algo == '老笔'
+                            // **老笔 算法**：检查两个分型之间是否至少有1根独立的Kx
+                            // 通过比较它们在 kx_array 中的索引距离来判断
+                            // 索引距离 > 1，意味着中间至少隔了1个元素
+                            if new_fx_kx_index - last_fx.kx_index > 1
+                                is_valid_pen_formation := true
+                                is_valid_pen_formation
+
+                        // --- 如果笔的条件成立，则画线 ---
+                        if is_valid_pen_formation
+                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                            array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
+
+                            new_line = line.new(x1 = last_fx.time, y1 = last_fx.price, x2 = new_fx_time, y2 = new_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = PEN_WIDTH, xloc = xloc.bar_time)
+                            array.push(pen_lines, new_line)
+
+                    // 情况B: 新分型与上一个类型相同 -> 更新旧笔
+                    else // 新顶更高 或 新底更低
+                        if new_fx_type == 1 and new_fx_price > last_fx.price or new_fx_type == -1 and new_fx_price < last_fx.price
+
+                            label.delete(last_fx.label_id)
+                            if array.size(pen_lines) > 0
+                                line.delete(array.pop(pen_lines))
+
+                            array.pop(pen_fractals)
+
+                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                            array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
+
+                            if array.size(pen_fractals) > 1
+                                prev_fx = array.get(pen_fractals, array.size(pen_fractals) - 2)
+                                new_line = line.new(x1 = prev_fx.time, y1 = prev_fx.price, x2 = new_fx_time, y2 = new_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = PEN_WIDTH, xloc = xloc.bar_time)
+                                array.push(pen_lines, new_line)
+
+        // 4. 更新状态，准备下一根K线
+        current_kx := Kx.new(high, low, time, -1)
+        current_kx
