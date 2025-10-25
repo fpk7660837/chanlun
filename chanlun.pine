@@ -244,32 +244,31 @@ cleanup_after_pen_change() =>
     while array.size(pen_centers) > 0
         last_idx = array.size(pen_centers) - 1
         last_center = array.get(pen_centers, last_idx)
-        if last_center.end_pen_idx >= pen_count or last_center.start_pen_idx >= pen_count
-            if not na(last_center.box_id)
-                box.delete(last_center.box_id)
-            array.pop(pen_centers)
-        else
+        remove_pen_center = last_center.end_pen_idx >= pen_count or last_center.start_pen_idx >= pen_count
+        if not remove_pen_center
             break
+        if not na(last_center.box_id)
+            box.delete(last_center.box_id)
+        array.pop(pen_centers)
     while array.size(seg_fractals) > 0
         last_seg_fx = array.last(seg_fractals)
-        if last_seg_fx.pen_idx >= pen_count
-            if not na(last_seg_fx.label_id)
-                label.delete(last_seg_fx.label_id)
-            array.pop(seg_fractals)
-            if array.size(seg_lines) > 0
-                line.delete(array.pop(seg_lines))
-        else
+        if last_seg_fx.pen_idx < pen_count
             break
+        if not na(last_seg_fx.label_id)
+            label.delete(last_seg_fx.label_id)
+        array.pop(seg_fractals)
+        if array.size(seg_lines) > 0
+            line.delete(array.pop(seg_lines))
     seg_fx_count = array.size(seg_fractals)
     while array.size(seg_centers) > 0
         last_idx = array.size(seg_centers) - 1
         last_center = array.get(seg_centers, last_idx)
-        if last_center.end_seg_idx >= seg_fx_count or last_center.start_seg_idx >= seg_fx_count
-            if not na(last_center.box_id)
-                box.delete(last_center.box_id)
-            array.pop(seg_centers)
-        else
+        remove_seg_center = last_center.end_seg_idx >= seg_fx_count or last_center.start_seg_idx >= seg_fx_count
+        if not remove_seg_center
             break
+        if not na(last_center.box_id)
+            box.delete(last_center.box_id)
+        array.pop(seg_centers)
 
 // --- 主逻辑 ---
 if na(current_kx)
