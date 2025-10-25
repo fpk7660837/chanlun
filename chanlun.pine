@@ -115,7 +115,7 @@ update_pen_centers() =>
                             last_center.end_time := fx3_end.time
                             if show_pen_center
                                 if na(last_center.box_id)
-                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.none)
                                 else
                                     box.set_left(last_center.box_id, last_center.start_time)
                                     box.set_right(last_center.box_id, last_center.end_time)
@@ -127,9 +127,19 @@ update_pen_centers() =>
                                     last_center.box_id := na
                             array.set(pen_centers, last_idx, last_center)
                 if not can_extend
+                    if array.size(pen_centers) > 0
+                        prev_idx = array.size(pen_centers) - 1
+                        prev_center = array.get(pen_centers, prev_idx)
+                        if fx1.time < prev_center.end_time
+                            prev_center.end_time := fx1.time
+                            if prev_center.end_time < prev_center.start_time
+                                prev_center.end_time := prev_center.start_time
+                            if not na(prev_center.box_id)
+                                box.set_right(prev_center.box_id, prev_center.end_time)
+                            array.set(pen_centers, prev_idx, prev_center)
                     box new_box = na
                     if show_pen_center
-                        new_box := box.new(left = fx1.time, top = center_high, right = fx3_end.time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
+                        new_box := box.new(left = fx1.time, top = center_high, right = fx3_end.time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.none)
                     array.push(pen_centers, PenCenter.new(array.size(pens) - 3, array.size(pens) - 1, center_high, center_low, fx1.time, fx3_end.time, new_box))
 
 detect_segment_fractals() =>
@@ -222,7 +232,7 @@ update_seg_centers() =>
                             last_center.end_time := seg4.time
                             if show_seg_center
                                 if na(last_center.box_id)
-                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.none)
                                 else
                                     box.set_left(last_center.box_id, last_center.start_time)
                                     box.set_right(last_center.box_id, last_center.end_time)
@@ -234,9 +244,19 @@ update_seg_centers() =>
                                     last_center.box_id := na
                             array.set(seg_centers, last_idx, last_center)
                 if not can_extend
+                    if array.size(seg_centers) > 0
+                        prev_idx = array.size(seg_centers) - 1
+                        prev_center = array.get(seg_centers, prev_idx)
+                        if seg1.time < prev_center.end_time
+                            prev_center.end_time := seg1.time
+                            if prev_center.end_time < prev_center.start_time
+                                prev_center.end_time := prev_center.start_time
+                            if not na(prev_center.box_id)
+                                box.set_right(prev_center.box_id, prev_center.end_time)
+                            array.set(seg_centers, prev_idx, prev_center)
                     box new_box = na
                     if show_seg_center
-                        new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
+                        new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.none)
                     array.push(seg_centers, SegCenter.new(array.size(seg_fractals) - 4, array.size(seg_fractals) - 1, center_high, center_low, seg1.time, seg4.time, new_box))
 
 cleanup_after_pen_change() =>
