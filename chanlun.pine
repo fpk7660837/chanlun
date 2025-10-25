@@ -270,7 +270,6 @@ cleanup_after_pen_change() =>
             array.pop(seg_centers)
         else
             break
-    return
 
 // --- 主逻辑 ---
 if na(current_kx)
