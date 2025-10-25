@@ -99,12 +99,8 @@ update_pen_centers() =>
             if has_overlap23
                 center_high = oh23
                 center_low = ol23
-                pen1_end_fx = array.get(pen_fractals, pen1.end_fx_idx)
-                pen2_start_fx = array.get(pen_fractals, pen2.start_fx_idx)
-                pen2_end_fx = array.get(pen_fractals, pen2.end_fx_idx)
-                pen3_start_fx = array.get(pen_fractals, pen3.start_fx_idx)
-                center_start_time = math.max(pen1_end_fx.time, pen2_start_fx.time)
-                center_end_time = math.min(pen2_end_fx.time, pen3_start_fx.time)
+                fx1 = array.get(pen_fractals, pen1.start_fx_idx)
+                fx3_end = array.get(pen_fractals, pen3.end_fx_idx)
                 can_extend = false
                 if array.size(pen_centers) > 0
                     last_idx = array.size(pen_centers) - 1
@@ -116,10 +112,10 @@ update_pen_centers() =>
                             last_center.high := new_high
                             last_center.low := new_low
                             last_center.end_pen_idx := array.size(pens) - 1
-                            last_center.end_time := math.max(last_center.end_time, center_end_time)
+                            last_center.end_time := fx3_end.time
                             if show_pen_center
                                 if na(last_center.box_id)
-                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.none)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
                                 else
                                     box.set_left(last_center.box_id, last_center.start_time)
                                     box.set_right(last_center.box_id, last_center.end_time)
@@ -131,16 +127,10 @@ update_pen_centers() =>
                                     last_center.box_id := na
                             array.set(pen_centers, last_idx, last_center)
                 if not can_extend
-                    if array.size(pen_centers) > 0
-                        prev_center = array.last(pen_centers)
-                        if center_start_time < prev_center.end_time
-                            center_start_time := prev_center.end_time
-                    if center_end_time < center_start_time
-                        center_end_time := center_start_time
                     box new_box = na
                     if show_pen_center
-                        new_box := box.new(left = center_start_time, top = center_high, right = center_end_time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.none)
-                    array.push(pen_centers, PenCenter.new(array.size(pens) - 3, array.size(pens) - 1, center_high, center_low, center_start_time, center_end_time, new_box))
+                        new_box := box.new(left = fx1.time, top = center_high, right = fx3_end.time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
+                    array.push(pen_centers, PenCenter.new(array.size(pens) - 3, array.size(pens) - 1, center_high, center_low, fx1.time, fx3_end.time, new_box))
 
 detect_segment_fractals() =>
     if array.size(pens) >= 3
@@ -232,7 +222,7 @@ update_seg_centers() =>
                             last_center.end_time := seg4.time
                             if show_seg_center
                                 if na(last_center.box_id)
-                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.none)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
                                 else
                                     box.set_left(last_center.box_id, last_center.start_time)
                                     box.set_right(last_center.box_id, last_center.end_time)
@@ -244,19 +234,9 @@ update_seg_centers() =>
                                     last_center.box_id := na
                             array.set(seg_centers, last_idx, last_center)
                 if not can_extend
-                    if array.size(seg_centers) > 0
-                        prev_idx = array.size(seg_centers) - 1
-                        prev_center = array.get(seg_centers, prev_idx)
-                        if seg1.time < prev_center.end_time
-                            prev_center.end_time := seg1.time
-                            if prev_center.end_time < prev_center.start_time
-                                prev_center.end_time := prev_center.start_time
-                            if not na(prev_center.box_id)
-                                box.set_right(prev_center.box_id, prev_center.end_time)
-                            array.set(seg_centers, prev_idx, prev_center)
                     box new_box = na
                     if show_seg_center
-                        new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.none)
+                        new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
                     array.push(seg_centers, SegCenter.new(array.size(seg_fractals) - 4, array.size(seg_fractals) - 1, center_high, center_low, seg1.time, seg4.time, new_box))
 
 cleanup_after_pen_change() =>
@@ -264,31 +244,32 @@ cleanup_after_pen_change() =>
     while array.size(pen_centers) > 0
         last_idx = array.size(pen_centers) - 1
         last_center = array.get(pen_centers, last_idx)
-        remove_pen_center = last_center.end_pen_idx >= pen_count or last_center.start_pen_idx >= pen_count
-        if not remove_pen_center
-            break
-        if not na(last_center.box_id)
-            box.delete(last_center.box_id)
-        array.pop(pen_centers)
+        if last_center.end_pen_idx >= pen_count or last_center.start_pen_idx >= pen_count
+            if not na(last_center.box_id)
+                box.delete(last_center.box_id)
+            array.pop(pen_centers)
+            continue
+        break
     while array.size(seg_fractals) > 0
         last_seg_fx = array.last(seg_fractals)
-        if last_seg_fx.pen_idx < pen_count
-            break
-        if not na(last_seg_fx.label_id)
-            label.delete(last_seg_fx.label_id)
-        array.pop(seg_fractals)
-        if array.size(seg_lines) > 0
-            line.delete(array.pop(seg_lines))
+        if last_seg_fx.pen_idx >= pen_count
+            if not na(last_seg_fx.label_id)
+                label.delete(last_seg_fx.label_id)
+            array.pop(seg_fractals)
+            if array.size(seg_lines) > 0
+                line.delete(array.pop(seg_lines))
+            continue
+        break
     seg_fx_count = array.size(seg_fractals)
     while array.size(seg_centers) > 0
         last_idx = array.size(seg_centers) - 1
         last_center = array.get(seg_centers, last_idx)
-        remove_seg_center = last_center.end_seg_idx >= seg_fx_count or last_center.start_seg_idx >= seg_fx_count
-        if not remove_seg_center
-            break
-        if not na(last_center.box_id)
-            box.delete(last_center.box_id)
-        array.pop(seg_centers)
+        if last_center.end_seg_idx >= seg_fx_count or last_center.start_seg_idx >= seg_fx_count
+            if not na(last_center.box_id)
+                box.delete(last_center.box_id)
+            array.pop(seg_centers)
+            continue
+        break
 
 // --- 主逻辑 ---
 if na(current_kx)
