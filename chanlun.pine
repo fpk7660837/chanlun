@@ -1,43 +1,277 @@
 //@version=6
-// --- 核心修改 ---
-// 1. 增加了 input.string 来让用户选择画笔算法。
-// 2. 修改了画笔的成立条件，使用 if/else 结构来应用不同的算法逻辑。
-// 3. 将原有的严格画笔逻辑归为“新笔/严格笔”，并新增了“老笔”的逻辑。
-indicator('缠论自动画笔 (Chanlun Strokes) [新老笔修正版]', '缠论笔 v4', overlay = true)
+indicator('缠论自动画笔线段中枢 (Chanlun Auto)', '缠论完整版', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
 
-// --- 常量和输入 ---
+// --- 输入参数 ---
+pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'], tooltip = '老笔：顶底分型之间至少有1根独立K线。\n新笔/严格笔：顶底分型的K线区间不允许重叠。')
+show_pen_center = input.bool(true, title = '显示笔中枢', tooltip = '显示笔中枢的矩形框')
+show_segments = input.bool(true, title = '显示线段', tooltip = '显示线段连线')
+show_seg_center = input.bool(true, title = '显示线段中枢', tooltip = '显示线段中枢的矩形框')
+
+// --- 颜色和样式常量 ---
 TOP_COLOR = color.new(color.red, 0)
 BOT_COLOR = color.new(color.green, 0)
 PEN_WIDTH = 2
-
-// --- 新增输入：画笔算法选择 ---
-pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'], tooltip = '老笔：顶底分型之间至少有1根独立K线。\n新笔/严格笔：顶底分型的K线区间不允许重叠。')
+SEG_WIDTH = 3
+PEN_CENTER_COLOR = color.new(color.blue, 80)
+SEG_CENTER_COLOR = color.new(color.orange, 80)
 
 // --- 类型定义 ---
 type Kx // 处理后的K线
-	float high
-	float low
-	int time
-	int index // 记录它在kx_array中的索引，便于计算距离
+    float high
+    float low
+    int time
+    int index
 
 type Fx // 分型
-	float price // 分型的极值价格
-	float fx_high // 构成该分型的K线的最高价
-	float fx_low // 构成该分型的K线的最低价
-	int time
-	int type // 1 for Top, -1 for Bottom
-	label label_id // 存储与该分型关联的标签ID
-	int kx_index // 记录该分型中心K线在kx_array中的索引
+    float price
+    float fx_high
+    float fx_low
+    int time
+    int type // 1 for Top, -1 for Bottom
+    label label_id
+    int kx_index
+
+type Pen // 笔
+    int start_fx_idx // 起始分型在pen_fractals中的索引
+    int end_fx_idx // 结束分型在pen_fractals中的索引
+    float high // 笔的高点
+    float low // 笔的低点
+    int direction // 1 for up, -1 for down
+
+type PenCenter // 笔中枢
+    int start_pen_idx // 起始笔索引
+    int end_pen_idx // 当前结束笔索引
+    float high // 中枢上沿
+    float low // 中枢下沿
+    int start_time // 起始时间
+    int end_time // 结束时间
+    box box_id // 中枢矩形框
+
+type SegFx // 线段分型（由笔构成）
+    float price
+    int time
+    int type // 1 for Top, -1 for Bottom
+    label label_id
+    int pen_idx // 对应的笔索引
+
+type SegCenter // 线段中枢
+    int start_seg_idx // 起始线段分型索引
+    int end_seg_idx // 当前结束线段分型索引
+    float high // 中枢上沿
+    float low // 中枢下沿
+    int start_time // 起始时间
+    int end_time // 结束时间
+    box box_id // 中枢矩形框
 
 // --- 变量初始化 ---
 var kx_array = array.new<Kx>()
 var pen_fractals = array.new<Fx>()
 var pen_lines = array.new<line>()
+var pens = array.new<Pen>()
+var pen_centers = array.new<PenCenter>()
+var seg_fractals = array.new<SegFx>()
+var seg_lines = array.new<line>()
+var seg_centers = array.new<SegCenter>()
 var Kx current_kx = na
 
-// --- 主逻辑 ---
+// --- 辅助函数 ---
+get_overlap(float h1, float l1, float h2, float l2) =>
+    overlap_high = math.min(h1, h2)
+    overlap_low = math.max(l1, l2)
+    has_overlap = overlap_low < overlap_high
+    [has_overlap, overlap_high, overlap_low]
 
-// 1. K线包含关系处理
+update_pen_centers() =>
+    if array.size(pens) >= 3
+        if not show_pen_center
+            for i = 0 to array.size(pen_centers) - 1
+                existing_center = array.get(pen_centers, i)
+                if not na(existing_center.box_id)
+                    box.delete(existing_center.box_id)
+                    existing_center.box_id := na
+                    array.set(pen_centers, i, existing_center)
+        pen1 = array.get(pens, array.size(pens) - 3)
+        pen2 = array.get(pens, array.size(pens) - 2)
+        pen3 = array.get(pens, array.size(pens) - 1)
+        [has_overlap12, oh12, ol12] = get_overlap(pen1.high, pen1.low, pen2.high, pen2.low)
+        if has_overlap12
+            [has_overlap23, oh23, ol23] = get_overlap(oh12, ol12, pen3.high, pen3.low)
+            if has_overlap23
+                center_high = oh23
+                center_low = ol23
+                fx1 = array.get(pen_fractals, pen1.start_fx_idx)
+                fx3_end = array.get(pen_fractals, pen3.end_fx_idx)
+                can_extend = false
+                if array.size(pen_centers) > 0
+                    last_idx = array.size(pen_centers) - 1
+                    last_center = array.get(pen_centers, last_idx)
+                    if last_center.end_pen_idx == array.size(pens) - 2
+                        [can_ext, new_high, new_low] = get_overlap(last_center.high, last_center.low, pen3.high, pen3.low)
+                        if can_ext
+                            can_extend := true
+                            last_center.high := new_high
+                            last_center.low := new_low
+                            last_center.end_pen_idx := array.size(pens) - 1
+                            last_center.end_time := fx3_end.time
+                            if show_pen_center
+                                if na(last_center.box_id)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
+                                else
+                                    box.set_left(last_center.box_id, last_center.start_time)
+                                    box.set_right(last_center.box_id, last_center.end_time)
+                                    box.set_top(last_center.box_id, last_center.high)
+                                    box.set_bottom(last_center.box_id, last_center.low)
+                            else
+                                if not na(last_center.box_id)
+                                    box.delete(last_center.box_id)
+                                    last_center.box_id := na
+                            array.set(pen_centers, last_idx, last_center)
+                if not can_extend
+                    new_box = na(box)
+                    if show_pen_center
+                        new_box := box.new(left = fx1.time, top = center_high, right = fx3_end.time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
+                    array.push(pen_centers, PenCenter.new(array.size(pens) - 3, array.size(pens) - 1, center_high, center_low, fx1.time, fx3_end.time, new_box))
+
+detect_segment_fractals() =>
+    if array.size(pens) >= 3
+        pen1 = array.get(pens, array.size(pens) - 3)
+        pen2 = array.get(pens, array.size(pens) - 2)
+        pen3 = array.get(pens, array.size(pens) - 1)
+        fx2 = array.get(pen_fractals, pen2.end_fx_idx)
+        is_top = false
+        is_bot = false
+        if pen2.direction == 1
+            if pen2.high > pen1.high and pen2.high > pen3.high
+                is_top := true
+        if pen2.direction == -1
+            if pen2.low < pen1.low and pen2.low < pen3.low
+                is_bot := true
+        if is_top or is_bot
+            new_seg_fx_price = is_top ? pen2.high : pen2.low
+            new_seg_fx_time = fx2.time
+            new_seg_fx_type = is_top ? 1 : -1
+            new_seg_fx_pen_idx = array.size(pens) - 2
+            if array.size(seg_fractals) == 0
+                new_label = na(label)
+                if show_segments
+                    new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
+                array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
+            else
+                last_seg_fx = array.last(seg_fractals)
+                if new_seg_fx_type != last_seg_fx.type
+                    if new_seg_fx_pen_idx - last_seg_fx.pen_idx >= 2
+                        new_label = na(label)
+                        if show_segments
+                            new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
+                        array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
+                        if show_segments
+                            new_seg_line = line.new(x1 = last_seg_fx.time, y1 = last_seg_fx.price, x2 = new_seg_fx_time, y2 = new_seg_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = SEG_WIDTH, xloc = xloc.bar_time, style = line.style_dashed)
+                            array.push(seg_lines, new_seg_line)
+                else
+                    if new_seg_fx_type == 1 and new_seg_fx_price > last_seg_fx.price or new_seg_fx_type == -1 and new_seg_fx_price < last_seg_fx.price
+                        if not na(last_seg_fx.label_id)
+                            label.delete(last_seg_fx.label_id)
+                        if array.size(seg_lines) > 0
+                            line.delete(array.pop(seg_lines))
+                        array.pop(seg_fractals)
+                        new_label = na(label)
+                        if show_segments
+                            new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
+                        array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
+                        if array.size(seg_fractals) > 1 and show_segments
+                            prev_seg_fx = array.get(seg_fractals, array.size(seg_fractals) - 2)
+                            new_seg_line = line.new(x1 = prev_seg_fx.time, y1 = prev_seg_fx.price, x2 = new_seg_fx_time, y2 = new_seg_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = SEG_WIDTH, xloc = xloc.bar_time, style = line.style_dashed)
+                            array.push(seg_lines, new_seg_line)
+
+update_seg_centers() =>
+    if array.size(seg_fractals) >= 4
+        if not show_seg_center
+            for i = 0 to array.size(seg_centers) - 1
+                existing_center = array.get(seg_centers, i)
+                if not na(existing_center.box_id)
+                    box.delete(existing_center.box_id)
+                    existing_center.box_id := na
+                    array.set(seg_centers, i, existing_center)
+        seg1 = array.get(seg_fractals, array.size(seg_fractals) - 4)
+        seg2 = array.get(seg_fractals, array.size(seg_fractals) - 3)
+        seg3 = array.get(seg_fractals, array.size(seg_fractals) - 2)
+        seg4 = array.get(seg_fractals, array.size(seg_fractals) - 1)
+        range1_high = math.max(seg1.price, seg2.price)
+        range1_low = math.min(seg1.price, seg2.price)
+        range2_high = math.max(seg2.price, seg3.price)
+        range2_low = math.min(seg2.price, seg3.price)
+        range3_high = math.max(seg3.price, seg4.price)
+        range3_low = math.min(seg3.price, seg4.price)
+        [has_overlap12, oh12, ol12] = get_overlap(range1_high, range1_low, range2_high, range2_low)
+        if has_overlap12
+            [has_overlap23, oh23, ol23] = get_overlap(oh12, ol12, range3_high, range3_low)
+            if has_overlap23
+                center_high = oh23
+                center_low = ol23
+                can_extend = false
+                if array.size(seg_centers) > 0
+                    last_idx = array.size(seg_centers) - 1
+                    last_center = array.get(seg_centers, last_idx)
+                    if last_center.end_seg_idx == array.size(seg_fractals) - 2
+                        [can_ext, new_high, new_low] = get_overlap(last_center.high, last_center.low, range3_high, range3_low)
+                        if can_ext
+                            can_extend := true
+                            last_center.high := new_high
+                            last_center.low := new_low
+                            last_center.end_seg_idx := array.size(seg_fractals) - 1
+                            last_center.end_time := seg4.time
+                            if show_seg_center
+                                if na(last_center.box_id)
+                                    last_center.box_id := box.new(left = last_center.start_time, top = last_center.high, right = last_center.end_time, bottom = last_center.low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
+                                else
+                                    box.set_left(last_center.box_id, last_center.start_time)
+                                    box.set_right(last_center.box_id, last_center.end_time)
+                                    box.set_top(last_center.box_id, last_center.high)
+                                    box.set_bottom(last_center.box_id, last_center.low)
+                            else
+                                if not na(last_center.box_id)
+                                    box.delete(last_center.box_id)
+                                    last_center.box_id := na
+                            array.set(seg_centers, last_idx, last_center)
+                if not can_extend
+                    new_box = na(box)
+                    if show_seg_center
+                        new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
+                    array.push(seg_centers, SegCenter.new(array.size(seg_fractals) - 4, array.size(seg_fractals) - 1, center_high, center_low, seg1.time, seg4.time, new_box))
+
+cleanup_after_pen_change() =>
+    pen_count = array.size(pens)
+    while array.size(pen_centers) > 0
+        last_idx = array.size(pen_centers) - 1
+        last_center = array.get(pen_centers, last_idx)
+        if last_center.end_pen_idx >= pen_count or last_center.start_pen_idx >= pen_count
+            if not na(last_center.box_id)
+                box.delete(last_center.box_id)
+            array.pop(pen_centers)
+        else
+            break
+    while array.size(seg_fractals) > 0
+        last_seg_fx = array.last(seg_fractals)
+        if last_seg_fx.pen_idx >= pen_count
+            if not na(last_seg_fx.label_id)
+                label.delete(last_seg_fx.label_id)
+            array.pop(seg_fractals)
+            if array.size(seg_lines) > 0
+                line.delete(array.pop(seg_lines))
+        else
+            break
+    seg_fx_count = array.size(seg_fractals)
+    while array.size(seg_centers) > 0
+        last_idx = array.size(seg_centers) - 1
+        last_center = array.get(seg_centers, last_idx)
+        if last_center.end_seg_idx >= seg_fx_count or last_center.start_seg_idx >= seg_fx_count
+            if not na(last_center.box_id)
+                box.delete(last_center.box_id)
+            array.pop(seg_centers)
+        else
+            break
+
+// --- 主逻辑 ---
 if na(current_kx)
     current_kx := Kx.new(high, low, time, -1)
     current_kx
@@ -45,98 +279,77 @@ else
     h = current_kx.high
     l = current_kx.low
     is_merged = false
-
-    // 包含关系判断
     if high >= h and low <= l or high <= h and low >= l
         is_merged := true
-
-        // 合并K线（根据方向决定保留最高高点还是最低低点）
-        // 这里简化为只合并价格范围
         current_kx.high := math.max(high, h)
         current_kx.low := math.min(low, l)
         current_kx.time := time
         current_kx.time
-
     if not is_merged
-        // 存储处理完的K线，并赋予其在数组中的索引
         current_kx.index := array.size(kx_array)
         array.push(kx_array, current_kx)
-
-        // 2. 检查是否形成分型
         if array.size(kx_array) >= 3
             k1 = array.get(kx_array, array.size(kx_array) - 3)
             k2 = array.get(kx_array, array.size(kx_array) - 2)
             k3 = array.get(kx_array, array.size(kx_array) - 1)
-
-            // 标准分型判断
             is_top = k2.high > k1.high and k2.high > k3.high and k2.low > k1.low and k2.low > k3.low
             is_bot = k2.low < k1.low and k2.low < k3.low and k2.high < k1.high and k2.high < k3.high
-
             if is_top or is_bot
                 new_fx_price = is_top ? k2.high : k2.low
                 new_fx_time = k2.time
                 new_fx_type = is_top ? 1 : -1
-                new_fx_kx_index = k2.index // 获取分型中心K的索引
-
-                // 3. 处理分型，形成或更新笔
+                new_fx_kx_index = k2.index
                 if array.size(pen_fractals) == 0
-                    // 第一个分型
-                    new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                    new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.small, xloc = xloc.bar_time)
                     array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
                 else
                     last_fx = array.last(pen_fractals)
-
-                    // 情况A: 新分型与上一个类型不同 -> 尝试形成新笔
                     if new_fx_type != last_fx.type
-
-                        // --- 关键修正：根据用户选择的算法判断笔是否成立 ---
-                        bool is_valid_pen_formation = false
-
+                        is_valid_pen_formation = false
                         if pen_algo == '新笔/严格笔'
-                            // **新笔/严格笔 算法**：检查价格区间的严格分离
-                            if new_fx_type == 1 // 新顶，旧底（向上笔）
-                                if k2.low > last_fx.fx_high // 顶分型低点 > 底分型高点
+                            if new_fx_type == 1
+                                if k2.low > last_fx.fx_high
                                     is_valid_pen_formation := true
-                                    is_valid_pen_formation
-                            else // 新底，旧顶（向下笔）
-                                if k2.high < last_fx.fx_low // 底分型高点 < 顶分型低点
+                            else
+                                if k2.high < last_fx.fx_low
                                     is_valid_pen_formation := true
-                                    is_valid_pen_formation
-
                         else if pen_algo == '老笔'
-                            // **老笔 算法**：检查两个分型之间是否至少有1根独立的Kx
-                            // 通过比较它们在 kx_array 中的索引距离来判断
-                            // 索引距离 > 1，意味着中间至少隔了1个元素
                             if new_fx_kx_index - last_fx.kx_index > 1
                                 is_valid_pen_formation := true
-                                is_valid_pen_formation
-
-                        // --- 如果笔的条件成立，则画线 ---
                         if is_valid_pen_formation
-                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.small, xloc = xloc.bar_time)
                             array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
-
                             new_line = line.new(x1 = last_fx.time, y1 = last_fx.price, x2 = new_fx_time, y2 = new_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = PEN_WIDTH, xloc = xloc.bar_time)
                             array.push(pen_lines, new_line)
-
-                    // 情况B: 新分型与上一个类型相同 -> 更新旧笔
-                    else // 新顶更高 或 新底更低
+                            pen_high = math.max(last_fx.price, new_fx_price)
+                            pen_low = math.min(last_fx.price, new_fx_price)
+                            pen_dir = new_fx_type
+                            array.push(pens, Pen.new(array.size(pen_fractals) - 2, array.size(pen_fractals) - 1, pen_high, pen_low, pen_dir))
+                            update_pen_centers()
+                            detect_segment_fractals()
+                            update_seg_centers()
+                    else
                         if new_fx_type == 1 and new_fx_price > last_fx.price or new_fx_type == -1 and new_fx_price < last_fx.price
-
-                            label.delete(last_fx.label_id)
+                            if not na(last_fx.label_id)
+                                label.delete(last_fx.label_id)
                             if array.size(pen_lines) > 0
                                 line.delete(array.pop(pen_lines))
-
+                            if array.size(pens) > 0
+                                array.pop(pens)
+                                cleanup_after_pen_change()
                             array.pop(pen_fractals)
-
-                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, xloc = xloc.bar_time)
+                            new_label = label.new(x = new_fx_time, y = new_fx_price, text = is_top ? '顶' : '底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.small, xloc = xloc.bar_time)
                             array.push(pen_fractals, Fx.new(new_fx_price, k2.high, k2.low, new_fx_time, new_fx_type, new_label, new_fx_kx_index))
-
                             if array.size(pen_fractals) > 1
                                 prev_fx = array.get(pen_fractals, array.size(pen_fractals) - 2)
                                 new_line = line.new(x1 = prev_fx.time, y1 = prev_fx.price, x2 = new_fx_time, y2 = new_fx_price, color = is_top ? TOP_COLOR : BOT_COLOR, width = PEN_WIDTH, xloc = xloc.bar_time)
                                 array.push(pen_lines, new_line)
-
-        // 4. 更新状态，准备下一根K线
+                                pen_high = math.max(prev_fx.price, new_fx_price)
+                                pen_low = math.min(prev_fx.price, new_fx_price)
+                                pen_dir = new_fx_type
+                                array.push(pens, Pen.new(array.size(pen_fractals) - 2, array.size(pen_fractals) - 1, pen_high, pen_low, pen_dir))
+                                update_pen_centers()
+                                detect_segment_fractals()
+                                update_seg_centers()
         current_kx := Kx.new(high, low, time, -1)
         current_kx
