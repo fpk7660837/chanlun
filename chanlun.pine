@@ -127,7 +127,7 @@ update_pen_centers() =>
                                     last_center.box_id := na
                             array.set(pen_centers, last_idx, last_center)
                 if not can_extend
-                    new_box = na(box)
+                    box new_box = na
                     if show_pen_center
                         new_box := box.new(left = fx1.time, top = center_high, right = fx3_end.time, bottom = center_low, bgcolor = PEN_CENTER_COLOR, border_color = color.blue, border_width = 1, xloc = xloc.bar_time, extend = extend.right)
                     array.push(pen_centers, PenCenter.new(array.size(pens) - 3, array.size(pens) - 1, center_high, center_low, fx1.time, fx3_end.time, new_box))
@@ -152,7 +152,7 @@ detect_segment_fractals() =>
             new_seg_fx_type = is_top ? 1 : -1
             new_seg_fx_pen_idx = array.size(pens) - 2
             if array.size(seg_fractals) == 0
-                new_label = na(label)
+                label new_label = na
                 if show_segments
                     new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
                 array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
@@ -160,7 +160,7 @@ detect_segment_fractals() =>
                 last_seg_fx = array.last(seg_fractals)
                 if new_seg_fx_type != last_seg_fx.type
                     if new_seg_fx_pen_idx - last_seg_fx.pen_idx >= 2
-                        new_label = na(label)
+                        label new_label = na
                         if show_segments
                             new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
                         array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
@@ -174,7 +174,7 @@ detect_segment_fractals() =>
                         if array.size(seg_lines) > 0
                             line.delete(array.pop(seg_lines))
                         array.pop(seg_fractals)
-                        new_label = na(label)
+                        label new_label = na
                         if show_segments
                             new_label := label.new(x = new_seg_fx_time, y = new_seg_fx_price, text = is_top ? '段顶' : '段底', color = is_top ? TOP_COLOR : BOT_COLOR, textcolor = color.white, style = is_top ? label.style_label_down : label.style_label_up, size = size.normal, xloc = xloc.bar_time)
                         array.push(seg_fractals, SegFx.new(new_seg_fx_price, new_seg_fx_time, new_seg_fx_type, new_label, new_seg_fx_pen_idx))
@@ -234,7 +234,7 @@ update_seg_centers() =>
                                     last_center.box_id := na
                             array.set(seg_centers, last_idx, last_center)
                 if not can_extend
-                    new_box = na(box)
+                    box new_box = na
                     if show_seg_center
                         new_box := box.new(left = seg1.time, top = center_high, right = seg4.time, bottom = center_low, bgcolor = SEG_CENTER_COLOR, border_color = color.orange, border_width = 2, xloc = xloc.bar_time, extend = extend.right)
                     array.push(seg_centers, SegCenter.new(array.size(seg_fractals) - 4, array.size(seg_fractals) - 1, center_high, center_low, seg1.time, seg4.time, new_box))
@@ -270,6 +270,7 @@ cleanup_after_pen_change() =>
             array.pop(seg_centers)
         else
             break
+    return
 
 // --- 主逻辑 ---
 if na(current_kx)
