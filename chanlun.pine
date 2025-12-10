@@ -4,12 +4,16 @@ indicator('缠论自动画笔中枢 (Chanlun Pro)', '缠论笔中枢', overlay =
 // === 用户参数 ===
 pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'])
 min_pen_bars = input.int(5, title = '笔最小K线数', minval = 3, maxval = 10, tooltip = '一笔至少需要的合并K线数量')
+gap_as_kl = input.bool(true, title = '缺口视为K线', tooltip = '如果两根K线之间有缺口，缺口可视为额外一根K线')
+bi_end_is_peak = input.bool(true, title = '笔端点必须是极值', tooltip = '笔的结束点必须是笔内的最高/最低点')
 show_pen_center = input.bool(true, title = '显示笔中枢')
 show_fractal_labels = input.bool(false, title = '显示顶底分型标签')
 show_divergence_signals = input.bool(true, title = '显示背驰信号')
 show_trade_signals = input.bool(true, title = '显示1/2/3买卖点')
 divergence_ratio = input.float(0.7, title = 'MACD力度减弱比例(<=该值判背驰)', minval = 0.1, maxval = 1.0, step = 0.05)
 use_slope_divergence = input.bool(true, title = '使用笔力度（幅度/天数）判背驰')
+zs_algo = input.string('3笔中枢', title = '中枢算法', options = ['3笔中枢', '5笔中枢'], tooltip = '3笔中枢：连续3笔直接构成中枢；5笔中枢：需要进入笔+3笔+离开笔')
+zs_combine = input.bool(true, title = '中枢合并', tooltip = '相邻中枢有重叠时合并为更大中枢')
 min_price_overlap_input = input.float(1.0, title = "中枢最小价格重叠", step = 0.5)
 min_price_overlap = min_price_overlap_input * syminfo.mintick
 
@@ -117,6 +121,42 @@ safe_delete_label(l) =>
 safe_delete_line(l) =>
     if not na(l)
         line.delete(l)
+
+// 检查两根合并K线之间是否有缺口
+has_gap_between(kx1_idx, kx2_idx) =>
+    bool has_gap = false
+    if kx1_idx >= 0 and kx2_idx > kx1_idx and kx2_idx < array.size(kx_array)
+        kx1 = array.get(kx_array, kx1_idx)
+        kx2 = array.get(kx_array, kx2_idx)
+        // 缺口：两根K线高低无重叠
+        has_gap := kx1.high < kx2.low or kx1.low > kx2.high
+    has_gap
+
+// 计算两个分型之间的缺口数量（用于gap_as_kl）
+count_gaps_between(start_kx_idx, end_kx_idx) =>
+    int gap_count = 0
+    if gap_as_kl and start_kx_idx >= 0 and end_kx_idx > start_kx_idx
+        for i = start_kx_idx to end_kx_idx - 1
+            if has_gap_between(i, i + 1)
+                gap_count := gap_count + 1
+    gap_count
+
+// 检查笔端点是否是极值（参考Python的end_is_peak）
+check_end_is_peak(start_kx_idx, end_kx_idx, is_up) =>
+    bool is_peak = true
+    if bi_end_is_peak and start_kx_idx >= 0 and end_kx_idx > start_kx_idx
+        end_kx = array.get(kx_array, end_kx_idx)
+        float cmp_value = is_up ? end_kx.high : end_kx.low
+        // 检查笔内所有K线，确保端点是极值
+        for i = start_kx_idx + 1 to end_kx_idx - 1
+            kx = array.get(kx_array, i)
+            if is_up and kx.high > cmp_value
+                is_peak := false
+                break
+            if not is_up and kx.low < cmp_value
+                is_peak := false
+                break
+    is_peak
 
 // 计算指定bar范围内的MACD面积
 calc_macd_area(start_bar, end_bar, dir) =>
@@ -251,112 +291,153 @@ cleanup_all_centers_and_signals() =>
     true
 
 // === 第一类买点检测 ===
-// 条件：向下笔创新低 + 底背驰 + 底分型确认
+// 严格缠论定义：
+// 1. "跌-涨-跌"结构（两段下跌笔中间有一段上涨笔连接）
+// 2. 第二段下跌笔的低点 < 第一段下跌笔的低点（创新低）
+// 3. 第二段下跌相比第一段出现背驰
+// 4. 底分型确认
 // 返回 [triggered, pen_idx, price]
 check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
     int result_pen_idx = ref_buy1_pen_idx
     float result_price = ref_buy1_price
     
+    // 需要至少3笔形成"跌-涨-跌"结构
     if pen_idx >= 2 and pen_idx < array.size(pens)
-        pen = array.get(pens, pen_idx)
+        pen3 = array.get(pens, pen_idx)      // 第二段下跌笔（当前笔）
+        pen2 = array.get(pens, pen_idx - 1)  // 中间上涨笔
+        pen1 = array.get(pens, pen_idx - 2)  // 第一段下跌笔
         
-        // 必须是向下笔且已确认
-        if pen.direction == -1 and pen.confirmed
-            // 检测背驰
-            [has_div, area_cur, area_prev] = detect_bi_divergence(pen_idx)
+        // 验证"跌-涨-跌"结构
+        bool is_valid_structure = pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
+        
+        // 必须是已确认的向下笔
+        if is_valid_structure and pen3.confirmed
+            // 条件2：创新低
+            bool creates_new_low = pen3.low < pen1.low
             
-            if has_div
-                // 寻找前一个向下笔，检查是否创新低
-                int prev_down_idx = na
-                int search_idx2 = pen_idx - 2
-                while search_idx2 >= 0
-                    prev = array.get(pens, search_idx2)
-                    if prev.direction == -1
-                        prev_down_idx := search_idx2
-                        break
-                    search_idx2 := search_idx2 - 2
+            if creates_new_low
+                // 条件3：背驰判断
+                // 价格背驰：第二段跌幅 ≤ 第一段跌幅
+                float drop1 = pen1.high - pen1.low  // 第一段下跌幅度
+                float drop2 = pen3.high - pen3.low  // 第二段下跌幅度
+                bool price_divergence = drop2 <= drop1
                 
-                if not na(prev_down_idx)
-                    prev_pen = array.get(pens, prev_down_idx)
-                    if pen.low < prev_pen.low  // 创新低
-                        triggered := true
-                        result_pen_idx := pen_idx
-                        result_price := pen.low
+                // MACD背驰：第二段MACD面积 < 第一段
+                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
+                
+                // 笔力度背驰（可选）
+                bool slope_divergence = false
+                if use_slope_divergence
+                    slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
+                
+                // 满足任一背驰条件
+                if price_divergence or macd_divergence or slope_divergence
+                    triggered := true
+                    result_pen_idx := pen_idx
+                    result_price := pen3.low
     [triggered, result_pen_idx, result_price]
 
 // === 第一类卖点检测 ===
-// 条件：向上笔创新高 + 顶背驰 + 顶分型确认
+// 严格缠论定义：
+// 1. "涨-跌-涨"结构（两段上涨笔中间有一段下跌笔连接）
+// 2. 第二段上涨笔的高点 > 第一段上涨笔的高点（创新高）
+// 3. 第二段上涨相比第一段出现背驰
+// 4. 顶分型确认
 check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
     int result_pen_idx = ref_sell1_pen_idx
     float result_price = ref_sell1_price
     
+    // 需要至少3笔形成"涨-跌-涨"结构
     if pen_idx >= 2 and pen_idx < array.size(pens)
-        pen = array.get(pens, pen_idx)
+        pen3 = array.get(pens, pen_idx)      // 第二段上涨笔（当前笔）
+        pen2 = array.get(pens, pen_idx - 1)  // 中间下跌笔
+        pen1 = array.get(pens, pen_idx - 2)  // 第一段上涨笔
         
-        // 必须是向上笔且已确认
-        if pen.direction == 1 and pen.confirmed
-            // 检测背驰
-            [has_div, area_cur, area_prev] = detect_bi_divergence(pen_idx)
+        // 验证"涨-跌-涨"结构
+        bool is_valid_structure = pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
+        
+        // 必须是已确认的向上笔
+        if is_valid_structure and pen3.confirmed
+            // 条件2：创新高
+            bool creates_new_high = pen3.high > pen1.high
             
-            if has_div
-                // 寻找前一个向上笔，检查是否创新高
-                int prev_up_idx = na
-                int search_idx3 = pen_idx - 2
-                while search_idx3 >= 0
-                    prev = array.get(pens, search_idx3)
-                    if prev.direction == 1
-                        prev_up_idx := search_idx3
-                        break
-                    search_idx3 := search_idx3 - 2
+            if creates_new_high
+                // 条件3：背驰判断
+                // 价格背驰：第二段涨幅 ≤ 第一段涨幅
+                float rise1 = pen1.high - pen1.low  // 第一段上涨幅度
+                float rise2 = pen3.high - pen3.low  // 第二段上涨幅度
+                bool price_divergence = rise2 <= rise1
                 
-                if not na(prev_up_idx)
-                    prev_pen = array.get(pens, prev_up_idx)
-                    if pen.high > prev_pen.high  // 创新高
-                        triggered := true
-                        result_pen_idx := pen_idx
-                        result_price := pen.high
+                // MACD背驰：第二段MACD面积 < 第一段
+                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
+                
+                // 笔力度背驰（可选）
+                bool slope_divergence = false
+                if use_slope_divergence
+                    slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
+                
+                // 满足任一背驰条件
+                if price_divergence or macd_divergence or slope_divergence
+                    triggered := true
+                    result_pen_idx := pen_idx
+                    result_price := pen3.high
     [triggered, result_pen_idx, result_price]
 
 // === 第二类买点检测 ===
-// 条件：1买后出现向上反弹，然后回调不破1买低点，出现底分型确认
+// 严格缠论定义：
+// 1. 已确认第一类买点（B1）
+// 2. 价格从B1反弹形成上涨笔
+// 3. 随后回调形成下跌笔
+// 4. 该下跌笔的低点 > B1的价格（不破前低）
+// 5. 回调结束时出现底分型 → 第二类买点
 check_buy2(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
-    if not na(ref_buy1_pen_idx) and pen_idx > ref_buy1_pen_idx + 2 and pen_idx < array.size(pens)
+    // 需要B1存在，且当前笔在B1之后至少2笔（反弹笔+回调笔）
+    if not na(ref_buy1_pen_idx) and pen_idx > ref_buy1_pen_idx + 1 and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
         
-        // 必须是向下回调笔且已确认
+        // 条件3/5：必须是向下回调笔且已确认（底分型确认）
         if pen.direction == -1 and pen.confirmed
-            // 回调低点不能破1买低点
-            if pen.low >= ref_buy1_price
-                // 确保之前有向上反弹
-                if pen_idx >= ref_buy1_pen_idx + 2
-                    prev_pen = array.get(pens, pen_idx - 1)
-                    if prev_pen.direction == 1  // 前一笔是向上
-                        triggered := true
+            // 条件4：回调低点不能破B1低点
+            if pen.low > ref_buy1_price
+                // 条件2：确保之前有向上反弹笔
+                prev_pen = array.get(pens, pen_idx - 1)
+                if prev_pen.direction == 1  // 前一笔是向上反弹
+                    triggered := true
     triggered
 
 // === 第二类卖点检测 ===
-// 条件：1卖后出现向下回调，然后反弹不破1卖高点，出现顶分型确认
+// 严格缠论定义：
+// 1. 已确认第一类卖点（S1）
+// 2. 价格从S1下跌形成下跌笔
+// 3. 随后反弹形成上涨笔
+// 4. 该上涨笔的高点 < S1的价格（不破前高）
+// 5. 反弹结束时出现顶分型 → 第二类卖点
 check_sell2(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
-    if not na(ref_sell1_pen_idx) and pen_idx > ref_sell1_pen_idx + 2 and pen_idx < array.size(pens)
+    // 需要S1存在，且当前笔在S1之后至少2笔（下跌笔+反弹笔）
+    if not na(ref_sell1_pen_idx) and pen_idx > ref_sell1_pen_idx + 1 and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
         
-        // 必须是向上反弹笔且已确认
+        // 条件3/5：必须是向上反弹笔且已确认（顶分型确认）
         if pen.direction == 1 and pen.confirmed
-            // 反弹高点不能破1卖高点
-            if pen.high <= ref_sell1_price
-                // 确保之前有向下回调
-                if pen_idx >= ref_sell1_pen_idx + 2
-                    prev_pen = array.get(pens, pen_idx - 1)
-                    if prev_pen.direction == -1  // 前一笔是向下
-                        triggered := true
+            // 条件4：反弹高点不能破S1高点
+            if pen.high < ref_sell1_price
+                // 条件2：确保之前有向下回调笔
+                prev_pen = array.get(pens, pen_idx - 1)
+                if prev_pen.direction == -1  // 前一笔是向下回调
+                    triggered := true
     triggered
 
 // === 第三类买点检测 ===
-// 条件：中枢向上突破后，回调不入中枢（低点 > ZG）
+// 严格缠论定义：
+// 1. 存在上涨中枢（"上-下-上"结构, direction = 1）
+// 2. 中枢完成后，价格向上突破ZG，形成离开中枢的上涨笔
+// 3. 随后回调形成下跌笔
+// 4. 回调低点 > ZG（即未进入中枢区间）
+// 5. 回调结束出现底分型 → 第三类买点
 check_buy3(pen_idx) =>
     bool triggered = false
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -364,29 +445,33 @@ check_buy3(pen_idx) =>
         
         // 必须是向下回调笔且已确认
         if pen.direction == -1 and pen.confirmed
-            // 检查最近的封闭中枢
+            // 检查所有封闭中枢
             int center_idx = array.size(pen_centers) - 1
             while center_idx >= 0 and not triggered
                 center = array.get(pen_centers, center_idx)
                 
-                if center.closed and pen_idx > center.end_pen_idx + 1
-                    // 检查是否有向上突破笔（离开中枢的笔）
+                // 条件1：必须是上涨中枢（上-下-上结构）
+                if center.direction == 1 and center.closed and pen_idx > center.end_pen_idx + 1
+                    // 条件2：检查是否有向上突破笔（离开中枢的笔）
                     int exit_pen_idx = center.end_pen_idx + 1
                     if exit_pen_idx < array.size(pens)
                         exit_pen = array.get(pens, exit_pen_idx)
                         
                         // 向上突破：离开笔是向上且高点超过ZG
                         if exit_pen.direction == 1 and exit_pen.high > center.high
-                            // 当前回调笔是否在突破后
-                            if pen_idx > exit_pen_idx
-                                // 回调低点不入中枢（低点 > ZG）
-                                if pen.low > center.high
-                                    triggered := true
+                            // 条件3/4：当前回调笔在突破后，且低点不入中枢（低点 > ZG）
+                            if pen_idx > exit_pen_idx and pen.low > center.high
+                                triggered := true
                 center_idx := center_idx - 1
     triggered
 
 // === 第三类卖点检测 ===
-// 条件：中枢向下跌破后，反弹不入中枢（高点 < ZD）
+// 严格缠论定义：
+// 1. 存在下跌中枢（"下-上-下"结构, direction = -1）
+// 2. 中枢完成后，价格向下跌破ZD
+// 3. 随后反弹形成上涨笔
+// 4. 反弹高点 < ZD（即未进入中枢区间）
+// 5. 顶分型确认 → 第三类卖点
 check_sell3(pen_idx) =>
     bool triggered = false
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -394,28 +479,30 @@ check_sell3(pen_idx) =>
         
         // 必须是向上反弹笔且已确认
         if pen.direction == 1 and pen.confirmed
-            // 检查最近的封闭中枢
+            // 检查所有封闭中枢
             int center_idx2 = array.size(pen_centers) - 1
             while center_idx2 >= 0 and not triggered
                 center = array.get(pen_centers, center_idx2)
                 
-                if center.closed and pen_idx > center.end_pen_idx + 1
-                    // 检查是否有向下跌破笔（离开中枢的笔）
+                // 条件1：必须是下跌中枢（下-上-下结构）
+                if center.direction == -1 and center.closed and pen_idx > center.end_pen_idx + 1
+                    // 条件2：检查是否有向下跌破笔（离开中枢的笔）
                     int exit_pen_idx = center.end_pen_idx + 1
                     if exit_pen_idx < array.size(pens)
                         exit_pen = array.get(pens, exit_pen_idx)
                         
                         // 向下跌破：离开笔是向下且低点低于ZD
                         if exit_pen.direction == -1 and exit_pen.low < center.low
-                            // 当前反弹笔是否在跌破后
-                            if pen_idx > exit_pen_idx
-                                // 反弹高点不入中枢（高点 < ZD）
-                                if pen.high < center.low
-                                    triggered := true
+                            // 条件3/4：当前反弹笔在跌破后，且高点不入中枢（高点 < ZD）
+                            if pen_idx > exit_pen_idx and pen.high < center.low
+                                triggered := true
                 center_idx2 := center_idx2 - 1
     triggered
 
 // === 中枢检测与构建 ===
+// 支持两种算法：
+// 1. 3笔中枢：连续3笔直接构成中枢（上-下-上 或 下-上-下）
+// 2. 5笔中枢：需要进入笔 + 3笔中枢 + 离开笔
 check_and_build_centers() =>
     pen_count = array.size(pens)
     
@@ -433,100 +520,174 @@ check_and_build_centers() =>
             safe_delete_label(sig.label_id)
         array.clear(trade_signals)
     
-    // 至少需要5笔：进入笔 + 3笔中枢 + 离开笔
-    if pen_count >= 5
-        int i = 0
-        while i <= pen_count - 5
-            // 中枢内部笔: i+1, i+2, i+3
-            pen_indices = array.new<int>()
-            array.push(pen_indices, i + 1)
-            array.push(pen_indices, i + 2)
-            array.push(pen_indices, i + 3)
-            
-            [overlap_h, overlap_l] = get_pens_overlap(pen_indices)
-            
-            if not na(overlap_h) and not na(overlap_l)
-                // 检查是否被已有中枢覆盖
-                bool is_covered = false
-                if array.size(pen_centers) > 0
-                    for k = 0 to array.size(pen_centers) - 1
-                        existing = array.get(pen_centers, k)
-                        if i + 1 >= existing.start_pen_idx and i + 1 <= existing.end_pen_idx
-                            is_covered := true
-                            break
+    // 根据算法选择不同的中枢构建逻辑
+    if zs_algo == '3笔中枢'
+        // ============ 3笔中枢算法 ============
+        // 连续3笔直接构成中枢
+        if pen_count >= 3
+            int i = 0
+            while i <= pen_count - 3
+                pen1 = array.get(pens, i)
+                pen2 = array.get(pens, i + 1)
+                pen3 = array.get(pens, i + 2)
                 
-                if not is_covered
-                    // 计算中枢的GG（最高点）和DD（最低点）
-                    float center_gg = overlap_h
-                    float center_dd = overlap_l
+                // 验证中枢结构：上-下-上 或 下-上-下
+                bool valid_structure = false
+                int center_dir = 0
+                
+                if pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
+                    valid_structure := true
+                    center_dir := 1  // 上涨中枢
+                else if pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
+                    valid_structure := true
+                    center_dir := -1  // 下跌中枢
+                
+                if valid_structure
+                    // ZG = 三笔高点的最小值, ZD = 三笔低点的最大值
+                    float zg = math.min(pen1.high, math.min(pen2.high, pen3.high))
+                    float zd = math.max(pen1.low, math.max(pen2.low, pen3.low))
                     
-                    // 尝试延伸中枢
-                    int end_idx = i + 3
-                    
-                    for j = i + 4 to pen_count - 2
-                        extended_indices = array.new<int>()
-                        for m = i + 1 to j
-                            array.push(extended_indices, m)
+                    if zg >= zd + min_price_overlap
+                        bool is_covered = false
+                        if array.size(pen_centers) > 0
+                            for k = 0 to array.size(pen_centers) - 1
+                                existing = array.get(pen_centers, k)
+                                if i >= existing.start_pen_idx and i <= existing.end_pen_idx
+                                    is_covered := true
+                                    break
                         
-                        [ext_h, ext_l] = get_pens_overlap(extended_indices)
+                        if not is_covered
+                            float center_gg = math.max(pen1.high, math.max(pen2.high, pen3.high))
+                            float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
+                            int end_idx = i + 2
+                            
+                            // 尝试延伸中枢（只有当有更多笔时才尝试）
+                            if i + 3 < pen_count
+                                for j = i + 3 to pen_count - 1
+                                    ext_pen = array.get(pens, j)
+                                    bool enters_zs = ext_pen.high >= zd and ext_pen.low <= zg
+                                    if enters_zs
+                                        float new_zg = math.min(zg, ext_pen.high)
+                                        float new_zd = math.max(zd, ext_pen.low)
+                                        if new_zg >= new_zd + min_price_overlap
+                                            zg := new_zg
+                                            zd := new_zd
+                                            end_idx := j
+                                            center_gg := math.max(center_gg, ext_pen.high)
+                                            center_dd := math.min(center_dd, ext_pen.low)
+                                        else
+                                            break
+                                    else
+                                        break
+                            
+                            bool is_closed = end_idx + 1 < pen_count
+                            last_pen = array.get(pens, end_idx)
+                            
+                            box new_box = na
+                            if show_pen_center
+                                new_box := box.new(left = pen1.start_time, top = zg, right = last_pen.end_time, bottom = zd, 
+                                     bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
+                            
+                            array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, pen1.start_time, last_pen.end_time, 
+                                 i, end_idx, new_box, is_closed, center_dir, false))
+                            i := end_idx
+                
+                i := i + 1
+    else
+        // ============ 5笔中枢算法 ============
+        // 需要5笔：进入笔 + 3笔中枢 + 离开笔
+        if pen_count >= 5
+            int i = 0
+            while i <= pen_count - 5
+                // 中枢内部笔: i+1, i+2, i+3
+                pen_in = array.get(pens, i)      // 进入笔
+                pen1 = array.get(pens, i + 1)
+                pen2 = array.get(pens, i + 2)
+                pen3 = array.get(pens, i + 3)
+                
+                // 计算3笔的重叠区间
+                float zg = math.min(pen1.high, math.min(pen2.high, pen3.high))
+                float zd = math.max(pen1.low, math.max(pen2.low, pen3.low))
+                
+                if zg >= zd + min_price_overlap
+                    bool is_covered = false
+                    if array.size(pen_centers) > 0
+                        for k = 0 to array.size(pen_centers) - 1
+                            existing = array.get(pen_centers, k)
+                            if i + 1 >= existing.start_pen_idx and i + 1 <= existing.end_pen_idx
+                                is_covered := true
+                                break
+                    
+                    if not is_covered
+                        float center_gg = math.max(pen1.high, math.max(pen2.high, pen3.high))
+                        float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
+                        int end_idx = i + 3
                         
-                        if not na(ext_h) and not na(ext_l)
-                            overlap_h := ext_h
-                            overlap_l := ext_l
-                            end_idx := j
-                            // 更新GG和DD
-                            ext_pen = array.get(pens, j)
-                            center_gg := math.max(center_gg, ext_pen.high)
-                            center_dd := math.min(center_dd, ext_pen.low)
-                        else
-                            break
-                    
-                    // 计算初始三笔的GG和DD
-                    for m = i + 1 to i + 3
-                        p = array.get(pens, m)
-                        center_gg := math.max(center_gg, p.high)
-                        center_dd := math.min(center_dd, p.low)
-                    
-                    // 创建中枢
-                    first_pen = array.get(pens, i + 1)
-                    last_pen = array.get(pens, end_idx)
-                    
-                    // 判断中枢方向
-                    int center_dir = first_pen.direction == -1 ? -1 : 1
-                    
-                    // 判断中枢是否封闭（是否有离开笔）
-                    bool is_closed = end_idx + 1 < pen_count
-                    
-                    box new_box = na
-                    if show_pen_center
-                        new_box := box.new(
-                             left = first_pen.start_time, 
-                             top = overlap_h, 
-                             right = last_pen.end_time, 
-                             bottom = overlap_l, 
-                             bgcolor = PEN_CENTER_COLOR, 
-                             border_color = PEN_COLOR, 
-                             border_width = 1, 
-                             xloc = xloc.bar_time)
-                    
-                    array.push(pen_centers, PenCenter.new(
-                         overlap_h, 
-                         overlap_l, 
-                         center_gg,
-                         center_dd,
-                         first_pen.start_time, 
-                         last_pen.end_time, 
-                         i + 1, 
-                         end_idx, 
-                         new_box,
-                         is_closed,
-                         center_dir,
-                         false))  // extended初始为false
-                    
-                    // 跳过已处理的笔
-                    i := end_idx
-            
-            i := i + 1
+                        // 尝试延伸中枢（只有当有更多笔时才尝试）
+                        if i + 4 <= pen_count - 2
+                            for j = i + 4 to pen_count - 2
+                                ext_pen = array.get(pens, j)
+                                float new_zg = math.min(zg, ext_pen.high)
+                                float new_zd = math.max(zd, ext_pen.low)
+                                if new_zg >= new_zd + min_price_overlap
+                                    zg := new_zg
+                                    zd := new_zd
+                                    end_idx := j
+                                    center_gg := math.max(center_gg, ext_pen.high)
+                                    center_dd := math.min(center_dd, ext_pen.low)
+                                else
+                                    break
+                        
+                        // 判断中枢方向（基于进入笔）
+                        int center_dir = pen_in.direction == -1 ? -1 : 1
+                        bool is_closed = end_idx + 1 < pen_count
+                        
+                        first_pen = array.get(pens, i + 1)
+                        last_pen = array.get(pens, end_idx)
+                        
+                        box new_box = na
+                        if show_pen_center
+                            new_box := box.new(left = first_pen.start_time, top = zg, right = last_pen.end_time, bottom = zd, 
+                                 bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
+                        
+                        array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, first_pen.start_time, last_pen.end_time, 
+                             i + 1, end_idx, new_box, is_closed, center_dir, false))
+                        i := end_idx
+                
+                i := i + 1
+    
+    // 中枢合并（参考Python实现的combine逻辑）
+    // 两个中枢如果ZG-ZD区间有重叠，可以合并为更大级别中枢
+    if zs_combine and array.size(pen_centers) >= 2
+        bool merged = true
+        while merged and array.size(pen_centers) >= 2
+            merged := false
+            int idx = array.size(pen_centers) - 2
+            if idx >= 0
+                curr = array.get(pen_centers, idx)
+                next = array.get(pen_centers, idx + 1)
+                // 检查ZG-ZD区间是否有重叠
+                bool has_overlap = math.max(curr.low, next.low) < math.min(curr.high, next.high)
+                if has_overlap
+                    // 合并中枢：扩展curr，删除next
+                    curr.low := math.min(curr.low, next.low)
+                    curr.high := math.max(curr.high, next.high)
+                    curr.gg := math.max(curr.gg, next.gg)
+                    curr.dd := math.min(curr.dd, next.dd)
+                    curr.end_time := next.end_time
+                    curr.end_pen_idx := next.end_pen_idx
+                    curr.closed := next.closed
+                    curr.extended := true
+                    // 更新box
+                    if show_pen_center and not na(curr.box_id)
+                        box.set_top(curr.box_id, curr.high)
+                        box.set_bottom(curr.box_id, curr.low)
+                        box.set_right(curr.box_id, curr.end_time)
+                        box.set_border_color(curr.box_id, color.orange)  // 合并后的中枢用橙色边框
+                    // 删除next
+                    safe_delete_box(next.box_id)
+                    array.pop(pen_centers)
+                    merged := true
     
     // 检测中枢扩展（参考Rust实现）
     if array.size(pen_centers) >= 2
@@ -645,8 +806,13 @@ else
                         else
                             is_valid := kx_gap >= 2
                         
-                        // 检查笔的最小K线数
-                        if is_valid and kx_gap + 1 >= min_pen_bars
+                        // 检查笔的最小K线数（加入缺口计数）
+                        int effective_kx_count = kx_gap + 1 + count_gaps_between(lastfx.kx_index, new_kx_index)
+                        
+                        // 检查笔端点是否是极值
+                        bool is_peak = check_end_is_peak(lastfx.kx_index, new_kx_index, new_type == 1)
+                        
+                        if is_valid and effective_kx_count >= min_pen_bars and is_peak
                             label lbl2 = na
                             if show_fractal_labels
                                 lbl2 := label.new(
@@ -904,7 +1070,7 @@ if barstate.islast
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
 // === 信息表格 (白色主题) ===
-var table info_table = table.new(position.top_right, 2, 8, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
+var table info_table = table.new(position.top_right, 2, 11, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
     // 白色主题颜色配置
     color title_bg = #f5f5f5      // 浅灰背景
@@ -913,6 +1079,8 @@ if barstate.islast
     color value_text = #1976d2    // 蓝色数值
     color highlight_text = #00897b // 绿色高亮
     color warning_text = #d32f2f   // 红色警告
+    color on_text = #4caf50       // 开启状态
+    color off_text = #9e9e9e      // 关闭状态
     
     table.cell(info_table, 0, 0, "合并K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 0, str.tostring(array.size(kx_array)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
@@ -924,15 +1092,22 @@ if barstate.islast
     table.cell(info_table, 1, 3, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
     table.cell(info_table, 0, 4, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 4, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 5, "算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 0, 5, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 5, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 6, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 6, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
-    // 显示扩展中枢数量
+    table.cell(info_table, 0, 6, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 6, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 7, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 7, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    // 新增参数显示
+    table.cell(info_table, 0, 8, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 8, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 9, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 9, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    // 显示扩展/合并中枢数量
     int ext_count = 0
     for i = 0 to array.size(pen_centers) - 1
         c = array.get(pen_centers, i)
         if c.extended
             ext_count := ext_count + 1
-    table.cell(info_table, 0, 7, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 7, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 10, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 10, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
