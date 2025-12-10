@@ -3,11 +3,13 @@ indicator('缠论自动画笔中枢 (Chanlun Pro)', '缠论笔中枢', overlay =
 
 // === 用户参数 ===
 pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'])
+min_pen_bars = input.int(5, title = '笔最小K线数', minval = 3, maxval = 10, tooltip = '一笔至少需要的合并K线数量')
 show_pen_center = input.bool(true, title = '显示笔中枢')
 show_fractal_labels = input.bool(false, title = '显示顶底分型标签')
 show_divergence_signals = input.bool(true, title = '显示背驰信号')
 show_trade_signals = input.bool(true, title = '显示1/2/3买卖点')
 divergence_ratio = input.float(0.7, title = 'MACD力度减弱比例(<=该值判背驰)', minval = 0.1, maxval = 1.0, step = 0.05)
+use_slope_divergence = input.bool(true, title = '使用笔力度（幅度/天数）判背驰')
 min_price_overlap_input = input.float(1.0, title = "中枢最小价格重叠", step = 0.5)
 min_price_overlap = min_price_overlap_input * syminfo.mintick
 
@@ -57,10 +59,15 @@ type Pen
     int end_bar_idx
     float macd_area  // MACD面积（力度）
     bool confirmed   // 笔是否已确认
+    int kx_count     // 合并K线数量
+    float amplitude  // 笔幅（价格变化）
+    float slope      // 笔力度（幅度/天数）
 
 type PenCenter
-    float high      // ZG
-    float low       // ZD
+    float high      // ZG = min(高点1, 高点2)
+    float low       // ZD = max(低点1, 低点2)
+    float gg        // 中枢最高点
+    float dd        // 中枢最低点
     int start_time
     int end_time
     int start_pen_idx
@@ -68,6 +75,7 @@ type PenCenter
     box box_id
     bool closed     // 中枢是否已封闭
     int direction   // 1=上涨中枢, -1=下跌中枢
+    bool extended   // 是否扩展为更大级别中枢
 
 type TradeSignal
     int type        // 1=1买, 2=2买, 3=3买, -1=1卖, -2=2卖, -3=3卖
@@ -142,11 +150,13 @@ add_trade_signal_label(t, price, txt, sig_type) =>
     lb
 
 // === 背驰检测 ===
-// 检测笔的背驰：比较两段同向笔的MACD面积
+// 检测笔的背驰：比较两段同向笔的MACD面积和笔力度
 detect_bi_divergence(current_pen_idx) =>
     bool has_divergence = false
     float area_current = 0.0
     float area_prev = 0.0
+    bool macd_div = false
+    bool slope_div = false
     
     if current_pen_idx >= 2 and current_pen_idx < array.size(pens)
         current_pen = array.get(pens, current_pen_idx)
@@ -175,10 +185,21 @@ detect_bi_divergence(current_pen_idx) =>
             else  // 向下笔
                 price_new_extreme := current_pen.low < prev_pen.low
             
-            // 价格创新极值但力度减弱 = 背驰
+            // MACD背驰：价格创新极值但MACD力度减弱
             if price_new_extreme and area_prev > 0
                 if area_current < area_prev * divergence_ratio
-                    has_divergence := true
+                    macd_div := true
+            
+            // 笔力度背驰（参考Rust实现）：笔天数>=前笔 且 (笔幅<前笔 或 笔力度<前笔)
+            if use_slope_divergence and price_new_extreme
+                bool bars_longer = current_pen.kx_count >= prev_pen.kx_count
+                bool amp_weaker = current_pen.amplitude < prev_pen.amplitude
+                bool slope_weaker = current_pen.slope < prev_pen.slope * divergence_ratio
+                if bars_longer and (amp_weaker or slope_weaker)
+                    slope_div := true
+            
+            // MACD背驰或笔力度背驰任一成立
+            has_divergence := macd_div or slope_div
     
     [has_divergence, area_current, area_prev]
 
@@ -435,6 +456,10 @@ check_and_build_centers() =>
                             break
                 
                 if not is_covered
+                    // 计算中枢的GG（最高点）和DD（最低点）
+                    float center_gg = overlap_h
+                    float center_dd = overlap_l
+                    
                     // 尝试延伸中枢
                     int end_idx = i + 3
                     
@@ -449,8 +474,18 @@ check_and_build_centers() =>
                             overlap_h := ext_h
                             overlap_l := ext_l
                             end_idx := j
+                            // 更新GG和DD
+                            ext_pen = array.get(pens, j)
+                            center_gg := math.max(center_gg, ext_pen.high)
+                            center_dd := math.min(center_dd, ext_pen.low)
                         else
                             break
+                    
+                    // 计算初始三笔的GG和DD
+                    for m = i + 1 to i + 3
+                        p = array.get(pens, m)
+                        center_gg := math.max(center_gg, p.high)
+                        center_dd := math.min(center_dd, p.low)
                     
                     // 创建中枢
                     first_pen = array.get(pens, i + 1)
@@ -477,18 +512,36 @@ check_and_build_centers() =>
                     array.push(pen_centers, PenCenter.new(
                          overlap_h, 
                          overlap_l, 
+                         center_gg,
+                         center_dd,
                          first_pen.start_time, 
                          last_pen.end_time, 
                          i + 1, 
                          end_idx, 
                          new_box,
                          is_closed,
-                         center_dir))
+                         center_dir,
+                         false))  // extended初始为false
                     
                     // 跳过已处理的笔
                     i := end_idx
             
             i := i + 1
+    
+    // 检测中枢扩展（参考Rust实现）
+    if array.size(pen_centers) >= 2
+        int idx = 0
+        while idx < array.size(pen_centers) - 1
+            curr = array.get(pen_centers, idx)
+            next = array.get(pen_centers, idx + 1)
+            // 中枢扩展：后中枢ZG < 前中枢ZD 且 后中枢GG >= 前中枢DD
+            //          或 后中枢ZD > 前中枢ZG 且 后中枢DD <= 前中枢GG
+            bool expand_down = next.high < curr.low and next.gg >= curr.dd
+            bool expand_up = next.low > curr.high and next.dd <= curr.gg
+            if expand_down or expand_up
+                curr.extended := true
+                next.extended := true
+            idx := idx + 1
     
     // 处理买卖点信号 - 在主流程中处理
     true
@@ -592,7 +645,8 @@ else
                         else
                             is_valid := kx_gap >= 2
                         
-                        if is_valid
+                        // 检查笔的最小K线数
+                        if is_valid and kx_gap + 1 >= min_pen_bars
                             label lbl2 = na
                             if show_fractal_labels
                                 lbl2 := label.new(
@@ -620,6 +674,11 @@ else
                             
                             // 计算笔的MACD面积
                             float pen_macd_area = calc_macd_area(lastfx.bar_idx, new_bar_idx, new_type)
+                            
+                            // 计算笔的属性
+                            int pen_kx_count = kx_gap + 1
+                            float pen_amplitude = math.abs(new_price - lastfx.price)
+                            float pen_slope = pen_kx_count > 0 ? pen_amplitude / pen_kx_count : 0
                             
                             // 确认前一笔（如果存在）
                             if array.size(pens) > 0
@@ -650,7 +709,10 @@ else
                                  lastfx.bar_idx,
                                  new_bar_idx,
                                  pen_macd_area,
-                                 false))  // 新笔未确认
+                                 false,  // 新笔未确认
+                                 pen_kx_count,
+                                 pen_amplitude,
+                                 pen_slope))
                             
                             // 重新计算所有中枢和买卖点
                             check_and_build_centers()
@@ -704,6 +766,11 @@ else
                                 prevfx = array.get(pen_fractals, array.size(pen_fractals) - 2)
                                 float pen_macd_area2 = calc_macd_area(prevfx.bar_idx, new_bar_idx, new_type)
                                 
+                                // 计算笔的属性
+                                int pen_kx_count2 = new_kx_index - prevfx.kx_index + 1
+                                float pen_amplitude2 = math.abs(new_price - prevfx.price)
+                                float pen_slope2 = pen_kx_count2 > 0 ? pen_amplitude2 / pen_kx_count2 : 0
+                                
                                 line_color = new_type == 1 ? PEN_UP_COLOR : PEN_DOWN_COLOR
                                 pline2 = line.new(
                                      x1 = prevfx.time, 
@@ -726,7 +793,10 @@ else
                                      prevfx.bar_idx,
                                      new_bar_idx,
                                      pen_macd_area2,
-                                     false))
+                                     false,
+                                     pen_kx_count2,
+                                     pen_amplitude2,
+                                     pen_slope2))
                                 
                                 // 重新计算所有中枢和买卖点
                                 check_and_build_centers()
@@ -833,18 +903,36 @@ if barstate.islast
 // === 辅助图表 ===
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
-// === 信息表格 ===
-var table info_table = table.new(position.top_right, 2, 6, bgcolor = color.new(color.gray, 90))
+// === 信息表格 (白色主题) ===
+var table info_table = table.new(position.top_right, 2, 8, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
-    table.cell(info_table, 0, 0, "合并K线", text_color = color.white)
-    table.cell(info_table, 1, 0, str.tostring(array.size(kx_array)), text_color = color.white)
-    table.cell(info_table, 0, 1, "分型数", text_color = color.white)
-    table.cell(info_table, 1, 1, str.tostring(array.size(pen_fractals)), text_color = color.white)
-    table.cell(info_table, 0, 2, "笔数", text_color = color.white)
-    table.cell(info_table, 1, 2, str.tostring(array.size(pens)), text_color = color.white)
-    table.cell(info_table, 0, 3, "中枢数", text_color = color.white)
-    table.cell(info_table, 1, 3, str.tostring(array.size(pen_centers)), text_color = color.white)
-    table.cell(info_table, 0, 4, "买卖点", text_color = color.white)
-    table.cell(info_table, 1, 4, str.tostring(array.size(trade_signals)), text_color = color.white)
-    table.cell(info_table, 0, 5, "算法", text_color = color.white)
-    table.cell(info_table, 1, 5, pen_algo, text_color = color.white)
+    // 白色主题颜色配置
+    color title_bg = #f5f5f5      // 浅灰背景
+    color value_bg = #ffffff      // 白色背景
+    color title_text = #333333    // 深灰标题文字
+    color value_text = #1976d2    // 蓝色数值
+    color highlight_text = #00897b // 绿色高亮
+    color warning_text = #d32f2f   // 红色警告
+    
+    table.cell(info_table, 0, 0, "合并K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 0, str.tostring(array.size(kx_array)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 1, "分型数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 1, str.tostring(array.size(pen_fractals)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 2, "笔数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 2, str.tostring(array.size(pens)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 3, "中枢数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 3, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 4, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 4, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 5, "算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 5, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 6, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 6, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    // 显示扩展中枢数量
+    int ext_count = 0
+    for i = 0 to array.size(pen_centers) - 1
+        c = array.get(pen_centers, i)
+        if c.extended
+            ext_count := ext_count + 1
+    table.cell(info_table, 0, 7, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 7, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
