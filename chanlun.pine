@@ -5,6 +5,9 @@ indicator('缠论自动画笔中枢 (Chanlun Auto)', '缠论笔中枢', overlay 
 pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '新笔/严格笔'])
 show_pen_center = input.bool(true, title = '显示笔中枢')
 show_fractal_labels = input.bool(false, title = '显示顶底分型标签')
+show_divergence_signals = input.bool(true, title = '显示背驰买卖标记')
+show_trade_signals = input.bool(true, title = '显示1/2/3买卖点')
+divergence_ratio = input.float(0.7, title = 'MACD力度减弱比例(<=该值判背驰)', minval = 0.1, maxval = 1.0, step = 0.05)
 min_price_overlap_input = input.float(1.0, title = "中枢最小价格重叠", step = 0.5)
 min_price_overlap = min_price_overlap_input * syminfo.mintick
 
@@ -38,6 +41,7 @@ type Pen
     int direction
     int start_time
     int end_time
+    float strength
 
 type PenCenter
     float high
@@ -47,6 +51,9 @@ type PenCenter
     int start_pen_idx
     int end_pen_idx
     box box_id
+    bool divergence
+    int exit_pen_idx
+    label signal_label
 
 // === 全局 ===
 var kx_array = array.new<Kx>()
@@ -54,12 +61,116 @@ var pen_fractals = array.new<Fx>()
 var pen_lines = array.new<line>()
 var pens = array.new<Pen>()
 var pen_centers = array.new<PenCenter>()
+var signal_labels = array.new<label>()
+var trade_labels = array.new<label>()
 var Kx current_kx = na
+
+// === 交易点状态 ===
+var int pending_div_dir = na
+var float pending_div_price = na
+var int pending_div_center_idx = na
+var float last_buy1_low = na
+var float last_sell1_high = na
+var float pullback_low_after_buy1 = na
+var float pullback_high_after_sell1 = na
+var float last_center_high = na
+var float last_center_low = na
+var int last_center_exit_dir = na
+var bool ready_buy3 = false
+var bool ready_sell3 = false
 
 // === 辅助函数 ===
 safe_delete_box(b) =>
     if not na(b)
         box.delete(b)
+
+safe_delete_label(l) =>
+    if not na(l)
+        label.delete(l)
+
+add_trade_label(t, price, text, dir) =>
+    if show_trade_signals
+        color c = dir == 1 ? color.red : color.green
+        label.style s = dir == 1 ? label.style_label_down : label.style_label_up
+        label lb = label.new(
+             x = t,
+             y = price,
+             text = text,
+             color = c,
+             textcolor = color.white,
+             style = s,
+             xloc = xloc.bar_time)
+        array.push(trade_labels, lb)
+
+get_pen_strength() =>
+    // 计算笔力度指标，用于背驰判定（固定 MACD 柱）
+    [macd, signal, hist] = ta.macd(close, 12, 26, 9)
+    hist
+
+detect_pen_divergence(exit_pen_idx, start_pen_idx) =>
+    // 以离开中枢的笔与此前同方向笔比较：价格创新高/低但力度减弱
+    bool has_div = false
+    if exit_pen_idx < array.size(pens) and start_pen_idx >= 0
+        exit_pen = array.get(pens, exit_pen_idx)
+        int prev_idx = na
+        for p = exit_pen_idx - 1 downto start_pen_idx
+            prior = array.get(pens, p)
+            if prior.direction == exit_pen.direction
+                prev_idx := p
+                break
+        if not na(prev_idx)
+            prior_pen = array.get(pens, prev_idx)
+            bool price_new = exit_pen.direction == 1 ? exit_pen.high > prior_pen.high : exit_pen.low < prior_pen.low
+            bool strength_weaker = math.abs(exit_pen.strength) < math.abs(prior_pen.strength) * divergence_ratio
+            has_div := price_new and strength_weaker
+    has_div
+
+process_trade_points(new_type, new_price, new_time) =>
+    // 1买/1卖：背驰后等待反向分型确认
+    if not na(pending_div_dir) and new_type != pending_div_dir
+        if pending_div_dir == -1
+            add_trade_label(new_time, new_price, '1B', -1)
+            last_buy1_low := new_price
+            pullback_low_after_buy1 := na
+        else
+            add_trade_label(new_time, new_price, '1S', 1)
+            last_sell1_high := new_price
+            pullback_high_after_sell1 := na
+        pending_div_dir := na
+        pending_div_price := na
+        pending_div_center_idx := na
+    
+    // 记录1买后的回踩低点，用于2买
+    if not na(last_buy1_low)
+        if new_type == -1
+            pullback_low_after_buy1 := na(pullback_low_after_buy1) ? new_price : math.min(pullback_low_after_buy1, new_price)
+        if new_type == 1 and not na(pullback_low_after_buy1) and pullback_low_after_buy1 >= last_buy1_low
+            add_trade_label(new_time, new_price, '2B', -1)
+            pullback_low_after_buy1 := na
+    
+    // 记录1卖后的回抽高点，用于2卖
+    if not na(last_sell1_high)
+        if new_type == 1
+            pullback_high_after_sell1 := na(pullback_high_after_sell1) ? new_price : math.max(pullback_high_after_sell1, new_price)
+        if new_type == -1 and not na(pullback_high_after_sell1) and pullback_high_after_sell1 <= last_sell1_high
+            add_trade_label(new_time, new_price, '2S', 1)
+            pullback_high_after_sell1 := na
+    
+    // 3买：上离开中枢后回踩不入内，出现向上分型
+    if not na(last_center_exit_dir) and last_center_exit_dir == 1 and not na(last_center_high)
+        if new_type == -1 and new_price >= last_center_high
+            ready_buy3 := true
+        if new_type == 1 and ready_buy3
+            add_trade_label(new_time, new_price, '3B', -1)
+            ready_buy3 := false
+    
+    // 3卖：下离开中枢后回抽不入内，出现向下分型
+    if not na(last_center_exit_dir) and last_center_exit_dir == -1 and not na(last_center_low)
+        if new_type == 1 and new_price <= last_center_low
+            ready_sell3 := true
+        if new_type == -1 and ready_sell3
+            add_trade_label(new_time, new_price, '3S', 1)
+            ready_sell3 := false
 
 // === 核心:计算多笔的真实重叠区间 ===
 get_pens_overlap(pen_indices) =>
@@ -101,7 +212,29 @@ check_and_add_center() =>
         for i = 0 to array.size(pen_centers) - 1
             center = array.get(pen_centers, i)
             safe_delete_box(center.box_id)
+            safe_delete_label(center.signal_label)
         array.clear(pen_centers)
+    
+    // 清理旧信号标签
+    if array.size(signal_labels) > 0
+        for i = 0 to array.size(signal_labels) - 1
+            safe_delete_label(array.get(signal_labels, i))
+        array.clear(signal_labels)
+    if array.size(trade_labels) > 0
+        for i = 0 to array.size(trade_labels) - 1
+            safe_delete_label(array.get(trade_labels, i))
+        array.clear(trade_labels)
+    pending_div_dir := na
+    pending_div_price := na
+    pending_div_center_idx := na
+    pullback_low_after_buy1 := na
+    pullback_high_after_sell1 := na
+    ready_buy3 := false
+    ready_sell3 := false
+    if array.size(trade_labels) > 0
+        for i = 0 to array.size(trade_labels) - 1
+            safe_delete_label(array.get(trade_labels, i))
+        array.clear(trade_labels)
     
     // 第二步:只有至少5笔时才检测中枢
     if pen_count >= 5
@@ -170,6 +303,30 @@ check_and_add_center() =>
                              border_width = 1, 
                              xloc = xloc.bar_time)
                     
+                    bool has_divergence = false
+                    int exit_pen_idx = na
+                    label sig_label = na
+                    
+                    // 检测离开笔背驰：取中枢后的第一笔，与中枢内最近的同向笔比较
+                    exit_pen_idx := end_idx + 1 < pen_count ? end_idx + 1 : na
+                    if not na(exit_pen_idx)
+                        has_divergence := detect_pen_divergence(exit_pen_idx, i + 1)
+                        if has_divergence and show_divergence_signals
+                            exit_pen = array.get(pens, exit_pen_idx)
+                            float sig_price = exit_pen.direction == 1 ? exit_pen.high : exit_pen.low
+                            string sig_text = exit_pen.direction == 1 ? 'Sell(div)' : 'Buy(div)'
+                            color sig_color = exit_pen.direction == 1 ? color.red : color.green
+                            label.style sig_style = exit_pen.direction == 1 ? label.style_label_down : label.style_label_up
+                            sig_label := label.new(
+                                 x = exit_pen.end_time,
+                                 y = sig_price,
+                                 text = sig_text,
+                                 color = sig_color,
+                                 textcolor = color.white,
+                                 style = sig_style,
+                                 xloc = xloc.bar_time)
+                            array.push(signal_labels, sig_label)
+                    
                     array.push(pen_centers, PenCenter.new(
                          overlap_h, 
                          overlap_l, 
@@ -177,7 +334,24 @@ check_and_add_center() =>
                          last_pen.end_time, 
                          i + 1, 
                          end_idx, 
-                         new_box))
+                         new_box,
+                         has_divergence,
+                         exit_pen_idx,
+                         sig_label))
+                    
+                    // 更新最近中枢信息
+                    last_center_high := overlap_h
+                    last_center_low := overlap_l
+                    last_center_exit_dir := not na(exit_pen_idx) ? array.get(pens, exit_pen_idx).direction : na
+                    ready_buy3 := false
+                    ready_sell3 := false
+                    
+                    // 若出现背驰，记录待确认1买/1卖
+                    if has_divergence and not na(exit_pen_idx)
+                        exit_pen = array.get(pens, exit_pen_idx)
+                        pending_div_dir := exit_pen.direction
+                        pending_div_price := exit_pen.direction == 1 ? exit_pen.high : exit_pen.low
+                        pending_div_center_idx := array.size(pen_centers) - 1
                     
                     // 跳过已经处理的笔
                     i := end_idx
@@ -194,7 +368,12 @@ cleanup_after_pen_change() =>
         for i = 0 to array.size(pen_centers) - 1
             center = array.get(pen_centers, i)
             safe_delete_box(center.box_id)
+            safe_delete_label(center.signal_label)
         array.clear(pen_centers)
+    if array.size(signal_labels) > 0
+        for i = 0 to array.size(signal_labels) - 1
+            safe_delete_label(array.get(signal_labels, i))
+        array.clear(signal_labels)
 
 // === 主流程 ===
 if na(current_kx)
@@ -293,6 +472,10 @@ else
                                  lbl2, 
                                  new_kx_index))
                             
+                            // 交易点判定
+                            process_trade_points(new_type, new_price, new_time)
+                            
+                            float pen_strength = get_pen_strength()
                             pline = line.new(
                                  x1 = lastfx.time, 
                                  y1 = lastfx.price, 
@@ -311,7 +494,8 @@ else
                                  math.min(lastfx.price, new_price), 
                                  pen_direction, 
                                  lastfx.time, 
-                                 new_time))
+                                 new_time,
+                                 pen_strength))
                             
                             // 每次添加笔后,重新计算所有中枢
                             bool result = check_and_add_center()
@@ -351,8 +535,12 @@ else
                                  lbl3, 
                                  new_kx_index))
                             
+                            // 交易点判定
+                            process_trade_points(new_type, new_price, new_time)
+                            
                             if array.size(pen_fractals) > 1
                                 prevfx = array.get(pen_fractals, array.size(pen_fractals) - 2)
+                                float pen_strength2 = get_pen_strength()
                                 pline2 = line.new(
                                      x1 = prevfx.time, 
                                      y1 = prevfx.price, 
@@ -371,7 +559,8 @@ else
                                      math.min(prevfx.price, new_price), 
                                      pen_direction, 
                                      prevfx.time, 
-                                     new_time))
+                                     new_time,
+                                     pen_strength2))
                                 
                                 // 每次修改笔后,重新计算所有中枢
                                 bool result = check_and_add_center()
