@@ -38,7 +38,7 @@ show_divergence_signals = input.bool(true, title = '显示背驰信号')
 show_trade_signals = input.bool(true, title = '显示买卖点')
 show_labels = input.bool(true, title = '显示价格标签')
 show_info_table = input.bool(true, title = '显示信息表')
-max_display_items = input.int(50, title = '最大显示数量', maxval = 50)
+max_display_items = input.int(500, title = '最大显示数量', maxval = 500)
 
 // MACD参数
 macd_fast = input.int(12, title = 'MACD快线周期', minval = 1)
@@ -123,7 +123,7 @@ type PenCenter
     float breakout_price // 突破价格
 
 type TradeSignal
-    int type        // 1=1买, 1p=1买增强, 2=2买, 2s=2买增强, 3a=3买a类, 3b=3买b类, negative for sell
+    int type        // 1=1买, 2=2买, 3=3买, -1=1卖, -2=2卖, -3=3卖
     int level       // 买卖点级别
     int bar_idx
     int time
@@ -141,7 +141,8 @@ var pens = array.new<Pen>()
 var segments = array.new<Segment>()
 var pen_centers = array.new<PenCenter>()
 var trade_signals = array.new<TradeSignal>()
-var Kx current_kx = na
+var bool current_kx_initialized = false
+var Kx current_kx = Kx.new(high, low, time, 0, bar_index)
 
 // 存储MACD历史值用于面积计算
 var macd_hist_array = array.new<float>()
@@ -201,7 +202,7 @@ cleanup_drawing_objects() =>
         safe_delete_box(center.box_id)
 
     // 清理过多的买卖点标签
-    int max_signals = 20
+    int max_signals = max_display_items
     while array.size(trade_signals) > max_signals
         sig = array.shift(trade_signals)
         safe_delete_label(sig.label_id)
@@ -217,25 +218,23 @@ draw_by_priority() =>
                 if na(sig.label_id) and show_trade_signals
                     // 根据信号类型生成适当的tooltip
                     string tooltip = ""
-                    if sig.type == 1 or sig.type == 101
-                        tooltip := sig.type == 101 ? "【1买增强 1B+】\n\n类型: 第一类买点增强" : "【1买 1B】\n\n类型: 第一类买点"
-                    else if sig.type == -1 or sig.type == -101
-                        tooltip := sig.type == -101 ? "【1卖增强 1S+】\n\n类型: 第一类卖点增强" : "【1卖 1S】\n\n类型: 第一类卖点"
-                    else if sig.type == 2 or sig.type == 202
-                        tooltip := sig.type == 202 ? "【2买增强 2B+】\n\n类型: 第二类买点增强" : "【2买 2B】\n\n类型: 第二类买点"
-                    else if sig.type == -2 or sig.type == -202
-                        tooltip := sig.type == -202 ? "【2卖增强 2S+】\n\n类型: 第二类卖点增强" : "【2卖 2S】\n\n类型: 第二类卖点"
+                    if sig.type == 1
+                        tooltip := "【1买】\n\n类型: 第一类买点"
+                    else if sig.type == -1
+                        tooltip := "【1卖】\n\n类型: 第一类卖点"
+                    else if sig.type == 2
+                        tooltip := "【2买】\n\n类型: 第二类买点"
+                    else if sig.type == -2
+                        tooltip := "【2卖】\n\n类型: 第二类卖点"
                     else if sig.type == 3
-                        tooltip := "【3买 3B】\n\n类型: 第三类买点"
+                        tooltip := "【3买】\n\n类型: 第三类买点"
                     else if sig.type == -3
-                        tooltip := "【3卖 3S】\n\n类型: 第三类卖点"
+                        tooltip := "【3卖】\n\n类型: 第三类卖点"
 
                     sig.label_id := add_trade_signal_label(sig.time, sig.price,
-                        sig.type == 101 ? "1B+" : sig.type == -101 ? "1S+" :
-                        sig.type == 202 ? "2B+" : sig.type == -202 ? "2S+" :
-                        sig.type == 1 ? "1B" : sig.type == -1 ? "1S" :
-                        sig.type == 2 ? "2B" : sig.type == -2 ? "2S" :
-                        sig.type == 3 ? "3B" : sig.type == -3 ? "3S" : "",
+                        sig.type == 1 ? "1买" : sig.type == -1 ? "1卖" :
+                        sig.type == 2 ? "2买" : sig.type == -2 ? "2卖" :
+                        sig.type == 3 ? "3买" : sig.type == -3 ? "3卖" : "",
                         sig.type > 0 ? 1 : -1, tooltip)
 
         // 2. 确保显示当前中枢
@@ -258,8 +257,8 @@ draw_by_priority() =>
             recent_lines = array.slice(pen_lines, array.size(pen_lines) - recent_count, array.size(pen_lines))
             // 确保最近的笔线存在（已在创建时处理）
 
-        // 4. 清理多余对象
-        cleanup_drawing_objects()
+        // 4. 清理多余对象（临时注释以调试显示问题）
+        // cleanup_drawing_objects()
 
 // 检查两根合并K线之间是否有缺口
 has_gap_between(kx1_idx, kx2_idx) =>
@@ -402,11 +401,12 @@ get_pens_overlap(pen_indices) =>
 build_segments() =>
     if array.size(pens) >= 3
         // 清理旧线段
-        for i = 0 to array.size(segments) - 1
-            seg = array.get(segments, i)
-            if not na(seg.line_id)
-                line.delete(seg.line_id)
-        array.clear(segments)
+        if array.size(segments) > 0
+            for i = 0 to array.size(segments) - 1
+                seg = array.get(segments, i)
+                if not na(seg.line_id)
+                    line.delete(seg.line_id)
+            array.clear(segments)
 
         int i = 0
         while i < array.size(pens) - 2
@@ -488,173 +488,159 @@ cleanup_all_centers_and_signals() =>
     true
 
 // === 第一类买点检测 ===
-// 严格缠论定义：
-// 1. "跌-涨-跌"结构（两段下跌笔中间有一段上涨笔连接）
-// 2. 第二段下跌笔的低点 < 第一段下跌笔的低点（创新低）
-// 3. 第二段下跌相比第一段出现背驰
-// 4. 底分型确认
+// 缠论原文定义：某级别下跌趋势中，一个次级别走势类型向下跌破最后一个缠中说禅走势中枢后形成的背驰点
 // 返回 [triggered, pen_idx, price, type]
 check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
     int result_pen_idx = ref_buy1_pen_idx
     float result_price = ref_buy1_price
-    int signal_type = 1  // 默认1买
+    int signal_type = 1  // 1买
 
-    // 需要至少3笔形成"跌-涨-跌"结构
-    if pen_idx >= 2 and pen_idx < array.size(pens)
-        pen3 = array.get(pens, pen_idx)      // 第二段下跌笔（当前笔）
-        pen2 = array.get(pens, pen_idx - 1)  // 中间上涨笔
-        pen1 = array.get(pens, pen_idx - 2)  // 第一段下跌笔
-
-        // 验证"跌-涨-跌"结构
-        bool is_valid_structure = pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
+    // 需要至少有一个中枢
+    if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
+        pen = array.get(pens, pen_idx)
 
         // 必须是已确认的向下笔
-        if is_valid_structure and pen3.confirmed
-            // 条件2：创新低
-            bool creates_new_low = pen3.low < pen1.low
+        if pen.direction == -1 and pen.confirmed
+            // 找到最后一个中枢
+            PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
-            if creates_new_low
-                // 条件3：背驰判断
-                // 价格背驰：第二段跌幅 ≤ 第一段跌幅
-                float drop1 = pen1.high - pen1.low  // 第一段下跌幅度
-                float drop2 = pen3.high - pen3.low  // 第二段下跌幅度
-                bool price_divergence = drop2 <= drop1
+            // 检查是否跌破最后一个中枢的下沿(ZD)
+            if pen.low < last_center.low
+                // 检查是否有背驰
+                // 寻找前一个同向的向下笔
+                int prev_down_idx = na
+                int search_idx = pen_idx - 2
+                while search_idx >= 0
+                    prev_pen = array.get(pens, search_idx)
+                    if prev_pen.direction == -1
+                        prev_down_idx := search_idx
+                        break
+                    search_idx := search_idx - 2
 
-                // MACD背驰：第二段MACD面积 < 第一段
-                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_rate
+                if not na(prev_down_idx)
+                    prev_pen = array.get(pens, prev_down_idx)
 
-                // 笔力度背驰（可选）
-                bool slope_divergence = false
-                if use_slope_divergence
-                    slope_divergence := pen3.slope <= pen1.slope * divergence_rate
+                    // MACD背驰检测
+                    bool macd_div = pen.macd_area < prev_pen.macd_area * divergence_rate
 
-                // 判断背驰强度以区分1买和1买增强
-                float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+                    // 价格幅度背驰
+                    float current_drop = pen.high - pen.low
+                    float prev_drop = prev_pen.high - prev_pen.low
+                    bool price_div = current_drop < prev_drop
 
-                // 满足任一背驰条件
-                if price_divergence or macd_divergence or slope_divergence
-                    triggered := true
-                    result_pen_idx := pen_idx
-                    result_price := pen3.low
+                    // 笔力度背驰
+                    bool slope_div = false
+                    if use_slope_divergence
+                        slope_div := pen.slope < prev_pen.slope * divergence_rate
 
-                    // 判断是否为1买增强（更强烈的背驰）
-                    if macd_divergence and macd_ratio < divergence_rate * 0.7
-                        signal_type := 101  // 1买增强编码
+                    // 满足背驰条件
+                    if macd_div or price_div or slope_div
+                        triggered := true
+                        result_pen_idx := pen_idx
+                        result_price := pen.low
     [triggered, result_pen_idx, result_price, signal_type]
 
 // === 第一类卖点检测 ===
-// 严格缠论定义：
-// 1. "涨-跌-涨"结构（两段上涨笔中间有一段下跌笔连接）
-// 2. 第二段上涨笔的高点 > 第一段上涨笔的高点（创新高）
-// 3. 第二段上涨相比第一段出现背驰
-// 4. 顶分型确认
+// 缠论原文定义：某级别上涨趋势中，一个次级别走势类型向上突破最后一个缠中说禅走势中枢后形成的背驰点
 check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
     int result_pen_idx = ref_sell1_pen_idx
     float result_price = ref_sell1_price
-    int signal_type = -1  // 默认1卖
+    int signal_type = -1  // 1卖
 
-    // 需要至少3笔形成"涨-跌-涨"结构
-    if pen_idx >= 2 and pen_idx < array.size(pens)
-        pen3 = array.get(pens, pen_idx)      // 第二段上涨笔（当前笔）
-        pen2 = array.get(pens, pen_idx - 1)  // 中间下跌笔
-        pen1 = array.get(pens, pen_idx - 2)  // 第一段上涨笔
-
-        // 验证"涨-跌-涨"结构
-        bool is_valid_structure = pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
+    // 需要至少有一个中枢
+    if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
+        pen = array.get(pens, pen_idx)
 
         // 必须是已确认的向上笔
-        if is_valid_structure and pen3.confirmed
-            // 条件2：创新高
-            bool creates_new_high = pen3.high > pen1.high
+        if pen.direction == 1 and pen.confirmed
+            // 找到最后一个中枢
+            PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
-            if creates_new_high
-                // 条件3：背驰判断
-                // 价格背驰：第二段涨幅 ≤ 第一段涨幅
-                float rise1 = pen1.high - pen1.low  // 第一段上涨幅度
-                float rise2 = pen3.high - pen3.low  // 第二段上涨幅度
-                bool price_divergence = rise2 <= rise1
+            // 检查是否突破最后一个中枢的上沿(ZG)
+            if pen.high > last_center.high
+                // 检查是否有背驰
+                // 寻找前一个同向的向上笔
+                int prev_up_idx = na
+                int search_idx = pen_idx - 2
+                while search_idx >= 0
+                    prev_pen = array.get(pens, search_idx)
+                    if prev_pen.direction == 1
+                        prev_up_idx := search_idx
+                        break
+                    search_idx := search_idx - 2
 
-                // MACD背驰：第二段MACD面积 < 第一段
-                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_rate
+                if not na(prev_up_idx)
+                    prev_pen = array.get(pens, prev_up_idx)
 
-                // 笔力度背驰（可选）
-                bool slope_divergence = false
-                if use_slope_divergence
-                    slope_divergence := pen3.slope <= pen1.slope * divergence_rate
+                    // MACD背驰检测
+                    bool macd_div = pen.macd_area < prev_pen.macd_area * divergence_rate
 
-                // 判断背驰强度以区分1卖和1卖增强
-                float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+                    // 价格幅度背驰
+                    float current_rise = pen.high - pen.low
+                    float prev_rise = prev_pen.high - prev_pen.low
+                    bool price_div = current_rise < prev_rise
 
-                // 满足任一背驰条件
-                if price_divergence or macd_divergence or slope_divergence
-                    triggered := true
-                    result_pen_idx := pen_idx
-                    result_price := pen3.high
+                    // 笔力度背驰
+                    bool slope_div = false
+                    if use_slope_divergence
+                        slope_div := pen.slope < prev_pen.slope * divergence_rate
 
-                    // 判断是否为1卖增强（更强烈的背驰）
-                    if macd_divergence and macd_ratio < divergence_rate * 0.7
-                        signal_type := -101  // 1卖增强编码
+                    // 满足背驰条件
+                    if macd_div or price_div or slope_div
+                        triggered := true
+                        result_pen_idx := pen_idx
+                        result_price := pen.high
     [triggered, result_pen_idx, result_price, signal_type]
 
 // === 第二类买点检测 ===
-// 严格缠论定义：
-// 1. 已确认第一类买点（B1）
-// 2. 价格从B1反弹形成上涨笔
-// 3. 随后回调形成下跌笔
-// 4. 该下跌笔的低点 > B1的价格（不破前低）
-// 5. 回调结束时出现底分型 → 第二类买点
+// 缠论原文定义：某级别中，第一类买点的次级别上涨结束后再次下跌的那个次级别走势类型的结束点
 check_buy2(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
-    int signal_type = 2  // 默认2买
+    int signal_type = 2  // 2买
 
-    // 需要B1存在，且当前笔在B1之后至少2笔（反弹笔+回调笔）
-    if not na(ref_buy1_pen_idx) and pen_idx > ref_buy1_pen_idx + 1 and pen_idx < array.size(pens)
+    // 需要B1存在，且当前笔在B1之后
+    if not na(ref_buy1_pen_idx) and pen_idx > ref_buy1_pen_idx and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
 
-        // 条件3/5：必须是向下回调笔且已确认（底分型确认）
+        // 必须是向下笔且已确认
         if pen.direction == -1 and pen.confirmed
-            // 条件4：回调低点不能破B1低点
-            if pen.low > ref_buy1_price
-                // 条件2：确保之前有向上反弹笔
-                prev_pen = array.get(pens, pen_idx - 1)
-                if prev_pen.direction == 1  // 前一笔是向上反弹
-                    triggered := true
+            // 检查是否在1买后的次级别上涨结束后
+            // 1买后的第一笔向上笔应该是上涨笔
+            if ref_buy1_pen_idx + 1 < array.size(pens)
+                first_up_pen = array.get(pens, ref_buy1_pen_idx + 1)
 
-                    // 检查是否为2买增强（更强的支撑）
-                    if pen.low > ref_buy1_price * 1.01  // 回调低点明显高于B1
-                        signal_type := 202  // 2买增强编码
+                // 确认1买后有上涨笔
+                if first_up_pen.direction == 1
+                    // 当前笔是上涨后的回调，且回调低点不低于1买低点
+                    if pen.low >= ref_buy1_price
+                        triggered := true
 
     [triggered, signal_type]
 
 // === 第二类卖点检测 ===
-// 严格缠论定义：
-// 1. 已确认第一类卖点（S1）
-// 2. 价格从S1下跌形成下跌笔
-// 3. 随后反弹形成上涨笔
-// 4. 该上涨笔的高点 < S1的价格（不破前高）
-// 5. 反弹结束时出现顶分型 → 第二类卖点
+// 缠论原文定义：某级别中，第一类卖点的次级别下跌结束后再次上涨的那个次级别走势类型的结束点
 check_sell2(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
-    int signal_type = -2  // 默认2卖
+    int signal_type = -2  // 2卖
 
-    // 需要S1存在，且当前笔在S1之后至少2笔（下跌笔+反弹笔）
-    if not na(ref_sell1_pen_idx) and pen_idx > ref_sell1_pen_idx + 1 and pen_idx < array.size(pens)
+    // 需要S1存在，且当前笔在S1之后
+    if not na(ref_sell1_pen_idx) and pen_idx > ref_sell1_pen_idx and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
 
-        // 条件3/5：必须是向上反弹笔且已确认（顶分型确认）
+        // 必须是向上笔且已确认
         if pen.direction == 1 and pen.confirmed
-            // 条件4：反弹高点不能破S1高点
-            if pen.high < ref_sell1_price
-                // 条件2：确保之前有向下回调笔
-                prev_pen = array.get(pens, pen_idx - 1)
-                if prev_pen.direction == -1  // 前一笔是向下回调
-                    triggered := true
+            // 检查是否在1卖后的次级别下跌结束后
+            // 1卖后的第一笔向下笔应该是下跌笔
+            if ref_sell1_pen_idx + 1 < array.size(pens)
+                first_down_pen = array.get(pens, ref_sell1_pen_idx + 1)
 
-                    // 检查是否为2卖增强（更强的阻力）
-                    if pen.high < ref_sell1_price * 0.99  // 反弹高点明显低于S1
-                        signal_type := -202  // 2卖增强编码
+                // 确认1卖后有下跌笔
+                if first_down_pen.direction == -1
+                    // 当前笔是下跌后的反弹，且反弹高点不高于1卖高点
+                    if pen.high <= ref_sell1_price
+                        triggered := true
 
     [triggered, signal_type]
 
@@ -969,8 +955,10 @@ array.push(macd_hist_array, macd_hist)
 if array.size(macd_hist_array) > MAX_HISTORY * 10
     macd_hist_array := array.slice(macd_hist_array, array.size(macd_hist_array) - MAX_HISTORY * 10, array.size(macd_hist_array))
 
-if na(current_kx)
+// 初始化current_kx（处理历史K线）
+if not current_kx_initialized
     current_kx := Kx.new(high, low, time, -1, bar_index)
+    current_kx_initialized := true
 else
     bool has_include = (high >= current_kx.high and low <= current_kx.low) or 
                        (high <= current_kx.high and low >= current_kx.low)
@@ -1104,16 +1092,22 @@ else
                             if array.size(pens) > 0
                                 prev_pen = array.last(pens)
                                 prev_pen.confirmed := true
+                                // 将已确认的笔改为实线
+                                if array.size(pen_lines) > 0
+                                    line.set_style(array.get(pen_lines, array.size(pen_lines) - 1), line.style_solid)
                             
                             // 画笔线
                             line_color = new_type == 1 ? PEN_UP_COLOR : PEN_DOWN_COLOR
+                            // 新笔默认未确认，使用虚线
+                            line_style = line.style_dashed
                             pline = line.new(
-                                 x1 = lastfx.time, 
-                                 y1 = lastfx.price, 
-                                 x2 = new_time, 
-                                 y2 = new_price, 
-                                 color = line_color, 
-                                 width = PEN_WIDTH, 
+                                 x1 = lastfx.time,
+                                 y1 = lastfx.price,
+                                 x2 = new_time,
+                                 y2 = new_price,
+                                 color = line_color,
+                                 width = PEN_WIDTH,
+                                 style = line_style,
                                  xloc = xloc.bar_time)
                             array.push(pen_lines, pline)
                             
@@ -1196,13 +1190,16 @@ else
                                 float pen_slope2 = pen_kx_count2 > 0 ? pen_amplitude2 / pen_kx_count2 : 0
                                 
                                 line_color = new_type == 1 ? PEN_UP_COLOR : PEN_DOWN_COLOR
+                                // 延伸的笔使用虚线（因为还未确认）
+                                line_style = line.style_dashed
                                 pline2 = line.new(
-                                     x1 = prevfx.time, 
-                                     y1 = prevfx.price, 
-                                     x2 = new_time, 
-                                     y2 = new_price, 
-                                     color = line_color, 
-                                     width = PEN_WIDTH, 
+                                     x1 = prevfx.time,
+                                     y1 = prevfx.price,
+                                     x2 = new_time,
+                                     y2 = new_price,
+                                     color = line_color,
+                                     width = PEN_WIDTH,
+                                     style = line_style,
                                      xloc = xloc.bar_time)
                                 array.push(pen_lines, pline2)
                                 
@@ -1260,60 +1257,23 @@ if barstate.islast
 
                     // 重新获取笔的信息用于生成tooltip
                     pen3 = array.get(pens, i)
-                    pen1 = array.get(pens, i - 2)
 
-                    // 根据类型显示不同标签
-                    string label_text = buy1_type == 101 ? "1B+" : "1B"
-                    int signal_type = buy1_type == 101 ? 101 : 1
-                    string reason = buy1_type == 101 ? "Type 1 Buy Enhanced" : "Type 1 Buy"
+                    // 获取最后一个中枢信息
+                    PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
                     // 生成详细的tooltip
-                    float drop1 = pen1.high - pen1.low
-                    float drop2 = pen3.high - pen3.low
-                    float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+                    string tooltip = "【1买】" + "\n" +
+                                   "\n" +
+                                   "缠论定义: 某级别下跌趋势中，一个次级别走势类型向下跌破最后一个缠中说禅走势中枢后形成的背驰点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
+                                   "• 跌破最后一个中枢下沿(ZD): " + str.tostring(math.round(last_center.low, 2)) + "\n" +
+                                   "• 当前低点: " + str.tostring(math.round(pen3.low, 2)) + "\n" +
+                                   "• MACD面积: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
+                                   "• 笔力度: " + str.tostring(math.round(pen3.slope, 4))
 
-                    string tooltip = ""
-                    if buy1_type == 101
-                        tooltip := "【1买增强 1B+】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 结构: 跌-涨-跌 3笔结构" + "\n" +
-                                   "• 条件: 第2段创新低" + "\n" +
-                                   "• 位置: " + str.tostring(math.round(pen3.low, 2)) + "\n" +
-                                   "\n" +
-                                   "背驰分析:" + "\n" +
-                                   "• MACD面积比: " + str.tostring(math.round(macd_ratio * 100)) + "%" + "\n" +
-                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_rate * 70)) + "%" + "\n" +
-                                   "• 背驰强度: 强背驰" + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 第1段跌幅: " + str.tostring(math.round(drop1, 2)) + "\n" +
-                                   "• 第2段跌幅: " + str.tostring(math.round(drop2, 2)) + "\n" +
-                                   "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                   "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4)) + "\n" +
-                                   "• 第2笔天数: " + str.tostring(pen3.kx_count) + "\n" +
-                                   "• 第1笔天数: " + str.tostring(pen1.kx_count)
-                    else
-                        tooltip := "【1买 1B】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 结构: 跌-涨-跌 3笔结构" + "\n" +
-                                   "• 条件: 第2段创新低" + "\n" +
-                                   "• 位置: " + str.tostring(math.round(pen3.low, 2)) + "\n" +
-                                   "\n" +
-                                   "背驰分析:" + "\n" +
-                                   "• 价格新低: " + str.tostring(math.round(pen3.low, 2)) + " < " + str.tostring(math.round(pen1.low, 2)) + "\n" +
-                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_rate ? "是" : "否") + "\n" +
-                                   "• 价格背驰: " + (drop2 <= drop1 ? "是" : "否") + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 第1段跌幅: " + str.tostring(math.round(drop1, 2)) + "\n" +
-                                   "• 第2段跌幅: " + str.tostring(math.round(drop2, 2)) + "\n" +
-                                   "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                   "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4))
-
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "1买", 1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类买点", lb))
 
                 // 检查1卖
                 [sell1_triggered, new_sell1_idx, new_sell1_price, sell1_type] = check_sell1(i, last_sell1_pen_idx, last_sell1_price)
@@ -1324,169 +1284,63 @@ if barstate.islast
 
                     // 重新获取笔的信息用于生成tooltip
                     pen3 = array.get(pens, i)
-                    pen1 = array.get(pens, i - 2)
 
-                    string label_text = sell1_type == -101 ? "1S+" : "1S"
-                    int signal_type = sell1_type == -101 ? -101 : -1
-                    string reason = sell1_type == -101 ? "Type 1 Sell Enhanced" : "Type 1 Sell"
+                    // 获取最后一个中枢信息
+                    PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
                     // 生成详细的tooltip
-                    float rise1 = pen1.high - pen1.low
-                    float rise2 = pen3.high - pen3.low
-                    float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+                    string tooltip = "【1卖】" + "\n" +
+                                   "\n" +
+                                   "缠论定义: 某级别上涨趋势中，一个次级别走势类型向上突破最后一个缠中说禅走势中枢后形成的背驰点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
+                                   "• 突破最后一个中枢上沿(ZG): " + str.tostring(math.round(last_center.high, 2)) + "\n" +
+                                   "• 当前高点: " + str.tostring(math.round(pen3.high, 2)) + "\n" +
+                                   "• MACD面积: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
+                                   "• 笔力度: " + str.tostring(math.round(pen3.slope, 4))
 
-                    string tooltip = ""
-                    if sell1_type == -101
-                        tooltip := "【1卖增强 1S+】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 结构: 涨-跌-涨 3笔结构" + "\n" +
-                                   "• 条件: 第2段创新高" + "\n" +
-                                   "• 位置: " + str.tostring(math.round(pen3.high, 2)) + "\n" +
-                                   "\n" +
-                                   "背驰分析:" + "\n" +
-                                   "• MACD面积比: " + str.tostring(math.round(macd_ratio * 100)) + "%" + "\n" +
-                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_rate * 70)) + "%" + "\n" +
-                                   "• 背驰强度: 强背驰" + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 第1段涨幅: " + str.tostring(math.round(rise1, 2)) + "\n" +
-                                   "• 第2段涨幅: " + str.tostring(math.round(rise2, 2)) + "\n" +
-                                   "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                   "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4)) + "\n" +
-                                   "• 第2笔天数: " + str.tostring(pen3.kx_count) + "\n" +
-                                   "• 第1笔天数: " + str.tostring(pen1.kx_count)
-                    else
-                        tooltip := "【1卖 1S】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 结构: 涨-跌-涨 3笔结构" + "\n" +
-                                   "• 条件: 第2段创新高" + "\n" +
-                                   "• 位置: " + str.tostring(math.round(pen3.high, 2)) + "\n" +
-                                   "\n" +
-                                   "背驰分析:" + "\n" +
-                                   "• 价格新高: " + str.tostring(math.round(pen3.high, 2)) + " > " + str.tostring(math.round(pen1.high, 2)) + "\n" +
-                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_rate ? "是" : "否") + "\n" +
-                                   "• 价格背驰: " + (rise2 <= rise1 ? "是" : "否") + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 第1段涨幅: " + str.tostring(math.round(rise1, 2)) + "\n" +
-                                   "• 第2段涨幅: " + str.tostring(math.round(rise2, 2)) + "\n" +
-                                   "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                   "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4))
-
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "1卖", -1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(-1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类卖点", lb))
 
                 // 检查2买
                 [buy2_triggered, buy2_type] = check_buy2(i, last_buy1_pen_idx, last_buy1_price)
                 if buy2_triggered
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
                     pen = array.get(pens, i)
-                    prev_pen = array.get(pens, i - 1)
-
-                    string label_text = buy2_type == 202 ? "2B+" : "2B"
-                    int signal_type = buy2_type == 202 ? 202 : 2
-                    string reason = buy2_type == 202 ? "Type 2 Buy Enhanced" : "Type 2 Buy"
 
                     // 生成详细的tooltip
-                    // 支撑强度：回调低点高于1买的幅度
-                    float support_strength = last_buy1_price > 0 ? (pen.low - last_buy1_price) / last_buy1_price * 100 : 0
-
-                    string tooltip = ""
-                    if buy2_type == 202
-                        tooltip := "【2买增强 2B+】" + "\n" +
+                    string tooltip = "【2买】" + "\n" +
                                    "\n" +
-                                   "生成逻辑:" + "\n" +
+                                   "缠论定义: 某级别中，第一类买点的次级别上涨结束后再次下跌的那个次级别走势类型的结束点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
                                    "• 前提: 已确认1买信号" + "\n" +
-                                   "• 结构: 1买后反弹+回调低点不低于1买低点" + "\n" +
-                                   "• 当前位置: " + str.tostring(math.round(pen.low, 2)) + "\n" +
                                    "• 1买位置: " + str.tostring(math.round(last_buy1_price, 2)) + "\n" +
-                                   "\n" +
-                                   "强度分析:" + "\n" +
-                                   "• 支撑强度: " + str.tostring(math.round(support_strength, 2)) + "%" + "\n" +
-                                   "• 强支撑标准: >1% (回调低点高于1买1%以上)" + "\n" +
-                                   "• 反弹高度: " + str.tostring(math.round(prev_pen.high - prev_pen.low, 2)) + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 回调低点距离1买: " + str.tostring(math.round(pen.low - last_buy1_price, 2)) + "\n" +
-                                   "• 反弹笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
-                                   "• 回调笔天数: " + str.tostring(pen.kx_count)
-                    else
-                        tooltip := "【2买 2B】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 前提: 已确认1买信号" + "\n" +
-                                   "• 结构: 1买后反弹+回调低点不低于1买低点" + "\n" +
                                    "• 当前位置: " + str.tostring(math.round(pen.low, 2)) + "\n" +
-                                   "• 1买位置: " + str.tostring(math.round(last_buy1_price, 2)) + "\n" +
-                                   "\n" +
-                                   "强度分析:" + "\n" +
-                                   "• 支撑有效: " + (pen.low > last_buy1_price ? "是" : "否") + "\n" +
-                                   "• 反弹高度: " + str.tostring(math.round(prev_pen.high - prev_pen.low, 2)) + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 回调低点距离1买: " + str.tostring(math.round(pen.low - last_buy1_price, 2)) + "\n" +
-                                   "• 反弹笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
-                                   "• 回调笔天数: " + str.tostring(pen.kx_count)
+                                   "• 支撑有效: " + (pen.low >= last_buy1_price ? "是" : "否")
 
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "2买", 1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类买点", lb))
 
                 // 检查2卖
                 [sell2_triggered, sell2_type] = check_sell2(i, last_sell1_pen_idx, last_sell1_price)
                 if sell2_triggered
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
                     pen = array.get(pens, i)
-                    prev_pen = array.get(pens, i - 1)
-
-                    string label_text = sell2_type == -202 ? "2S+" : "2S"
-                    int signal_type = sell2_type == -202 ? -202 : -2
-                    string reason = sell2_type == -202 ? "Type 2 Sell Enhanced" : "Type 2 Sell"
 
                     // 生成详细的tooltip
-                    // 阻力强度：1卖高于反弹高点的幅度
-                    float resistance_strength = last_sell1_price > 0 ? (last_sell1_price - pen.high) / last_sell1_price * 100 : 0
-
-                    string tooltip = ""
-                    if sell2_type == -202
-                        tooltip := "【2卖增强 2S+】" + "\n" +
+                    string tooltip = "【2卖】" + "\n" +
                                    "\n" +
-                                   "生成逻辑:" + "\n" +
+                                   "缠论定义: 某级别中，第一类卖点的次级别下跌结束后再次上涨的那个次级别走势类型的结束点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
                                    "• 前提: 已确认1卖信号" + "\n" +
-                                   "• 结构: 1卖后下跌+反弹高点不高于1卖高点" + "\n" +
-                                   "• 当前位置: " + str.tostring(math.round(pen.high, 2)) + "\n" +
                                    "• 1卖位置: " + str.tostring(math.round(last_sell1_price, 2)) + "\n" +
-                                   "\n" +
-                                   "强度分析:" + "\n" +
-                                   "• 阻力强度: " + str.tostring(math.round(resistance_strength, 2)) + "%" + "\n" +
-                                   "• 强阻力标准: >1% (反弹高点低于1卖1%以上)" + "\n" +
-                                   "• 下跌深度: " + str.tostring(math.round(prev_pen.high - prev_pen.low, 2)) + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 反弹高点距离1卖: " + str.tostring(math.round(last_sell1_price - pen.high, 2)) + "\n" +
-                                   "• 下跌笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
-                                   "• 反弹笔天数: " + str.tostring(pen.kx_count)
-                    else
-                        tooltip := "【2卖 2S】" + "\n" +
-                                   "\n" +
-                                   "生成逻辑:" + "\n" +
-                                   "• 前提: 已确认1卖信号" + "\n" +
-                                   "• 结构: 1卖后下跌+反弹高点不高于1卖高点" + "\n" +
                                    "• 当前位置: " + str.tostring(math.round(pen.high, 2)) + "\n" +
-                                   "• 1卖位置: " + str.tostring(math.round(last_sell1_price, 2)) + "\n" +
-                                   "\n" +
-                                   "强度分析:" + "\n" +
-                                   "• 阻力有效: " + (pen.high < last_sell1_price ? "是" : "否") + "\n" +
-                                   "• 下跌深度: " + str.tostring(math.round(prev_pen.high - prev_pen.low, 2)) + "\n" +
-                                   "\n" +
-                                   "详细数据:" + "\n" +
-                                   "• 反弹高点距离1卖: " + str.tostring(math.round(last_sell1_price - pen.high, 2)) + "\n" +
-                                   "• 下跌笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
-                                   "• 反弹笔天数: " + str.tostring(pen.kx_count)
+                                   "• 阻力有效: " + (pen.high <= last_sell1_price ? "是" : "否")
 
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "2卖", -1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(-2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类卖点", lb))
                 
                 // 检查3买
                 if check_buy3(i)
@@ -1511,9 +1365,11 @@ if barstate.islast
                                             break
 
                     // 生成详细的tooltip
-                    string tooltip = "【3买 3B】" + "\n" +
+                    string tooltip = "【3买】" + "\n" +
                                    "\n" +
-                                   "生成逻辑:" + "\n" +
+                                   "缠论定义: 一个次级别走势类型向上离开缠中说禅走势中枢，然后以一个次级别走势类型回试，其低点不跌破ZG，则构成第三类买点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
                                    "• 前提: 存在上涨中枢" + "\n" +
                                    "• 结构: 突破中枢后回抽不入中枢" + "\n" +
                                    "• 当前位置: " + str.tostring(math.round(pen.low, 2)) + "\n"
@@ -1524,11 +1380,10 @@ if barstate.islast
                                    "• 中枢上沿(ZG): " + str.tostring(math.round(ref_center.high, 2)) + "\n" +
                                    "• 中枢下沿(ZD): " + str.tostring(math.round(ref_center.low, 2)) + "\n" +
                                    "• 中枢中轴: " + str.tostring(math.round(ref_center.mid, 2)) + "\n" +
-                                   "• 回抽低点距离中枢: " + str.tostring(math.round(pen.low - ref_center.high, 2)) + "\n" +
-                                   "• 严格模式: " + (bsp_strict_3 ? "开启" : "关闭")
+                                   "• 回抽低点距离中枢: " + str.tostring(math.round(pen.low - ref_center.high, 2))
 
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3B", 1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "Type 3 Buy", lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3买", 1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类买点", lb))
 
                 // 检查3卖
                 if check_sell3(i)
@@ -1553,9 +1408,11 @@ if barstate.islast
                                             break
 
                     // 生成详细的tooltip
-                    string tooltip = "【3卖 3S】" + "\n" +
+                    string tooltip = "【3卖】" + "\n" +
                                    "\n" +
-                                   "生成逻辑:" + "\n" +
+                                   "缠论定义: 一个次级别走势类型向下离开缠中说禅走势中枢，然后以一个次级别走势类型回试，其高点不升破ZD，则构成第三类卖点" + "\n" +
+                                   "\n" +
+                                   "生成条件:" + "\n" +
                                    "• 前提: 存在下跌中枢" + "\n" +
                                    "• 结构: 跌破中枢后反弹不入中枢" + "\n" +
                                    "• 当前位置: " + str.tostring(math.round(pen.high, 2)) + "\n"
@@ -1566,42 +1423,41 @@ if barstate.islast
                                    "• 中枢上沿(ZG): " + str.tostring(math.round(ref_center.high, 2)) + "\n" +
                                    "• 中枢下沿(ZD): " + str.tostring(math.round(ref_center.low, 2)) + "\n" +
                                    "• 中枢中轴: " + str.tostring(math.round(ref_center.mid, 2)) + "\n" +
-                                   "• 反弹高点距离中枢: " + str.tostring(math.round(ref_center.low - pen.high, 2)) + "\n" +
-                                   "• 严格模式: " + (bsp_strict_3 ? "开启" : "关闭")
+                                   "• 反弹高点距离中枢: " + str.tostring(math.round(ref_center.low - pen.high, 2))
 
-                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3S", -1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(-3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "Type 3 Sell", lb))
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3卖", -1, tooltip)
+                    array.push(trade_signals, TradeSignal.new(-3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类卖点", lb))
     
-    // 显示背驰信号
-    if show_divergence_signals and pen_count >= 3
-        for i = math.max(2, pen_count - 5) to pen_count - 1
-            pen = array.get(pens, i)
-            if pen.confirmed
-                [has_div, area_cur, area_prev] = detect_bi_divergence(i)
-                if has_div
-                    end_fx = array.get(pen_fractals, pen.end_fx_idx)
-                    div_text = pen.direction == 1 ? "顶背驰" : "底背驰"
-                    div_color = pen.direction == 1 ? color.red : color.green
-                    
-                    // 检查是否已有该背驰的1买/1卖标签
-                    bool label_exists = false
-                    for j = 0 to array.size(trade_signals) - 1
-                        sig = array.get(trade_signals, j)
-                        if sig.ref_pen_idx == i and (sig.type == 1 or sig.type == -1)
-                            label_exists := true
-                            break
-                    
-                    if not label_exists
-                        // 显示背驰标签（独立于买卖点）
-                        label.new(
-                             x = end_fx.time,
-                             y = pen.direction == 1 ? pen.high * 1.001 : pen.low * 0.999,
-                             text = div_text,
-                             color = div_color,
-                             textcolor = color.white,
-                             style = pen.direction == 1 ? label.style_label_down : label.style_label_up,
-                             size = size.tiny,
-                             xloc = xloc.bar_time)
+    // 显示背驰信号（已注释 - 背驰信息会显示在1买/1卖的tooltip中）
+    // if show_divergence_signals and pen_count >= 3
+    //     for i = math.max(2, pen_count - 5) to pen_count - 1
+    //         pen = array.get(pens, i)
+    //         if pen.confirmed
+    //             [has_div, area_cur, area_prev] = detect_bi_divergence(i)
+    //             if has_div
+    //                 end_fx = array.get(pen_fractals, pen.end_fx_idx)
+    //                 div_text = pen.direction == 1 ? "顶背驰" : "底背驰"
+    //                 div_color = pen.direction == 1 ? color.red : color.green
+    //
+    //                 // 检查是否已有该背驰的1买/1卖标签
+    //                 bool label_exists = false
+    //                 for j = 0 to array.size(trade_signals) - 1
+    //                     sig = array.get(trade_signals, j)
+    //                     if sig.ref_pen_idx == i and (sig.type == 1 or sig.type == -1)
+    //                         label_exists := true
+    //                         break
+    //
+    //                 if not label_exists
+    //                     // 显示背驰标签（独立于买卖点）
+    //                     label.new(
+    //                          x = end_fx.time,
+    //                          y = pen.direction == 1 ? pen.high * 1.001 : pen.low * 0.999,
+    //                          text = div_text,
+    //                          color = div_color,
+    //                          textcolor = color.white,
+    //                          style = pen.direction == 1 ? label.style_label_down : label.style_label_up,
+    //                          size = size.tiny,
+    //                          xloc = xloc.bar_time)
 
 // === 辅助图表 ===
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
@@ -1666,18 +1522,18 @@ if barstate.islast
     if array.size(trade_signals) > 0
         latest_sig = array.get(trade_signals, array.size(trade_signals) - 1)
         string sig_name = ""
-        if latest_sig.type == 1 or latest_sig.type == 101
-            sig_name := latest_sig.type == 101 ? "1B+" : "1B"
-        else if latest_sig.type == -1 or latest_sig.type == -101
-            sig_name := latest_sig.type == -101 ? "1S+" : "1S"
-        else if latest_sig.type == 2 or latest_sig.type == 202
-            sig_name := latest_sig.type == 202 ? "2B+" : "2B"
-        else if latest_sig.type == -2 or latest_sig.type == -202
-            sig_name := latest_sig.type == -202 ? "2S+" : "2S"
+        if latest_sig.type == 1
+            sig_name := "1买"
+        else if latest_sig.type == -1
+            sig_name := "1卖"
+        else if latest_sig.type == 2
+            sig_name := "2买"
+        else if latest_sig.type == -2
+            sig_name := "2卖"
         else if latest_sig.type == 3
-            sig_name := "3B"
+            sig_name := "3买"
         else if latest_sig.type == -3
-            sig_name := "3S"
+            sig_name := "3卖"
 
         table.cell(info_table, 0, 15, "最新信号", text_color = title_text, bgcolor = title_bg, text_size = size.small)
         table.cell(info_table, 1, 15, sig_name, text_color = latest_sig.type > 0 ? on_text : warning_text, bgcolor = value_bg, text_size = size.small)
