@@ -11,7 +11,8 @@ bi_end_is_peak = input.bool(true, title = '笔端点必须是极值', tooltip = 
 segment_enabled = input.bool(false, title = '启用线段', tooltip = '启用线段作为笔和中枢之间的中间层')
 
 // 中枢设置
-zs_algo = input.string('3笔中枢', title = '中枢算法', options = ['3笔中枢', '5笔中枢'], tooltip = '3笔中枢：连续3笔直接构成中枢；5笔中枢：需要进入笔+3笔+离开笔')
+zs_type = input.string('笔中枢', title = '中枢类型', options = ['笔中枢', '线段中枢'], tooltip = '笔中枢：将笔作为次级别构建中枢；线段中枢：将线段作为次级别构建中枢')
+zs_algo = input.string('3笔中枢', title = '中枢算法', options = ['3笔中枢', '5笔中枢'], tooltip = '3笔中枢：连续3个次级别直接构成中枢；5笔中枢：进入段+3段中枢+离开段')
 zs_one_bi = input.bool(false, title = '单笔中枢', tooltip = '允许单笔形成中枢')
 zs_combine = input.bool(true, title = '中枢合并', tooltip = '相邻中枢有重叠时合并为更大中枢')
 min_price_overlap_input = input.float(1.0, title = "中枢最小价格重叠", step = 0.5)
@@ -712,27 +713,103 @@ check_sell3(pen_idx) =>
                 center_idx2 := center_idx2 - 1
     triggered
 
-// === 中枢检测与构建 ===
-// 支持两种算法：
-// 1. 3笔中枢：连续3笔直接构成中枢（上-下-上 或 下-上-下）
-// 2. 5笔中枢：需要进入笔 + 3笔中枢 + 离开笔
-check_and_build_centers() =>
+// === 基于线段的中枢构建 ===
+build_segment_centers() =>
+    segment_count = array.size(segments)
+
+    // 根据算法选择不同的中枢构建逻辑 (只有线段数>=3才处理)
+    if segment_count >= 3 and zs_algo == '3笔中枢'
+        // ============ 3线段中枢算法 ============
+        // 连续3个线段直接构成中枢
+        int i = 0
+        while i <= segment_count - 3
+            seg1 = array.get(segments, i)
+            seg2 = array.get(segments, i + 1)
+            seg3 = array.get(segments, i + 2)
+
+            // 验证中枢结构：上-下-上 或 下-上-下
+            bool valid_structure = false
+            int center_dir = 0
+
+            if seg1.direction == 1 and seg2.direction == -1 and seg3.direction == 1
+                valid_structure := true
+                center_dir := 1  // 上涨中枢
+            else if seg1.direction == -1 and seg2.direction == 1 and seg3.direction == -1
+                valid_structure := true
+                center_dir := -1  // 下跌中枢
+
+            if valid_structure
+                // 根据缠论正确定义计算中枢
+                float zg = 0.0
+                float zd = 0.0
+
+                if center_dir == 1  // 上涨中枢：下-上-下
+                    zg := math.min(seg2.high, seg3.high)
+                    zd := math.max(seg1.low, seg2.low)
+                else  // 下跌中枢：上-下-上
+                    zg := math.min(seg1.high, seg2.high)
+                    zd := math.max(seg2.low, seg3.low)
+
+                // GG = 中枢组件中的最高点
+                float center_gg = math.max(seg1.high, math.max(seg2.high, seg3.high))
+                // DD = 中枢组件中的最低点
+                float center_dd = math.min(seg1.low, math.min(seg2.low, seg3.low))
+
+                if zg >= zd + min_price_overlap
+                    bool is_covered = false
+                    if array.size(pen_centers) > 0
+                        for k = 0 to array.size(pen_centers) - 1
+                            existing = array.get(pen_centers, k)
+                            if i >= existing.start_pen_idx and i <= existing.end_pen_idx
+                                is_covered := true
+                                break
+
+                    if not is_covered
+                        int end_idx = i + 2
+
+                        // 尝试延伸中枢
+                        if i + 3 < segment_count
+                            for j = i + 3 to segment_count - 1
+                                ext_seg = array.get(segments, j)
+                                bool enters_zs = ext_seg.high >= zd and ext_seg.low <= zg
+                                if enters_zs
+                                    float new_zg = math.min(zg, ext_seg.high)
+                                    float new_zd = math.max(zd, ext_seg.low)
+                                    if new_zg >= new_zd + min_price_overlap
+                                        zg := new_zg
+                                        zd := new_zd
+                                        end_idx := j
+                                        center_gg := math.max(center_gg, ext_seg.high)
+                                        center_dd := math.min(center_dd, ext_seg.low)
+                                    else
+                                        break
+                                else
+                                    break
+
+                        float center_mid = (zg + zd) / 2
+                        bool is_closed = end_idx + 1 < segment_count
+                        last_seg = array.get(segments, end_idx)
+
+                        box new_box = na
+                        if show_pen_center
+                            new_box := box.new(left = seg1.start_time, top = zg, right = last_seg.end_time, bottom = zd,
+                                 bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
+
+                        // 转换线段索引为笔索引（用于买卖点判断）
+                        int start_pen_idx = seg1.start_pen_idx
+                        int end_pen_idx = last_seg.end_pen_idx
+
+                        array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, center_mid, seg1.start_time, last_seg.end_time,
+                             start_pen_idx, end_pen_idx, new_box, is_closed, center_dir, false, 1, false, 0.0))
+                        i := end_idx
+
+            i := i + 1
+    true
+
+// === 基于笔的中枢构建 ===
+build_pen_centers() =>
     pen_count = array.size(pens)
-    
-    // 清理所有现有中枢
-    if array.size(pen_centers) > 0
-        for i = 0 to array.size(pen_centers) - 1
-            center = array.get(pen_centers, i)
-            safe_delete_box(center.box_id)
-        array.clear(pen_centers)
-    
-    // 清理旧的交易信号
-    if array.size(trade_signals) > 0
-        for i = 0 to array.size(trade_signals) - 1
-            sig = array.get(trade_signals, i)
-            safe_delete_label(sig.label_id)
-        array.clear(trade_signals)
-    
+
     // 根据算法选择不同的中枢构建逻辑
     if zs_algo == '3笔中枢'
         // ============ 3笔中枢算法 ============
@@ -756,9 +833,27 @@ check_and_build_centers() =>
                     center_dir := -1  // 下跌中枢
                 
                 if valid_structure
-                    // ZG = 三笔高点的最小值, ZD = 三笔低点的最大值
-                    float zg = math.min(pen1.high, math.min(pen2.high, pen3.high))
-                    float zd = math.max(pen1.low, math.max(pen2.low, pen3.low))
+                    // 根据缠论正确定义计算中枢
+                    // ZG = min(g1, g2) - 前两个高点的较小者
+                    // ZD = max(d1, d2) - 前两个低点的较大者
+                    float zg = 0.0
+                    float zd = 0.0
+
+                    if center_dir == 1  // 上涨中枢：下-上-下
+                        // g1 = pen2.high, g2 = pen3.high（但还未形成）
+                        // d1 = pen1.low, d2 = pen2.low
+                        zg := math.min(pen2.high, pen3.high)  // 临时使用，实际应该等待第3个高点
+                        zd := math.max(pen1.low, pen2.low)
+                    else  // 下跌中枢：上-下-上
+                        // g1 = pen1.high, g2 = pen2.high
+                        // d1 = pen2.low, d2 = pen3.low
+                        zg := math.min(pen1.high, pen2.high)
+                        zd := math.max(pen2.low, pen3.low)  // 临时使用，实际应该等待第3个低点
+
+                    // GG = 中枢组件中的最高点
+                    float center_gg = math.max(pen1.high, math.max(pen2.high, pen3.high))
+                    // DD = 中枢组件中的最低点
+                    float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
                     
                     if zg >= zd + min_price_overlap
                         bool is_covered = false
@@ -768,10 +863,8 @@ check_and_build_centers() =>
                                 if i >= existing.start_pen_idx and i <= existing.end_pen_idx
                                     is_covered := true
                                     break
-                        
+
                         if not is_covered
-                            float center_gg = math.max(pen1.high, math.max(pen2.high, pen3.high))
-                            float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
                             int end_idx = i + 2
                             
                             // 尝试延伸中枢（只有当有更多笔时才尝试）
@@ -819,9 +912,26 @@ check_and_build_centers() =>
                 pen2 = array.get(pens, i + 2)
                 pen3 = array.get(pens, i + 3)
                 
-                // 计算3笔的重叠区间
-                float zg = math.min(pen1.high, math.min(pen2.high, pen3.high))
-                float zd = math.max(pen1.low, math.max(pen2.low, pen3.low))
+                // 根据缠论正确定义计算中枢
+                // 中枢由pen1, pen2, pen3三笔构成
+                // ZG = min(g1, g2) - 前两个高点的较小者
+                // ZD = max(d1, d2) - 前两个低点的较大者
+                float zg = 0.0
+                float zd = 0.0
+
+                // 判断中枢方向
+                int center_dir = pen_in.direction == -1 ? -1 : 1
+
+                if center_dir == 1  // 上涨中枢：进入笔向下，中枢为下-上-下
+                    // g1 = pen2.high, g2 = pen3.high
+                    // d1 = pen1.low, d2 = pen2.low
+                    zg := math.min(pen2.high, pen3.high)
+                    zd := math.max(pen1.low, pen2.low)
+                else  // 下跌中枢：进入笔向上，中枢为上-下-上
+                    // g1 = pen1.high, g2 = pen2.high
+                    // d1 = pen2.low, d2 = pen3.low
+                    zg := math.min(pen1.high, pen2.high)
+                    zd := math.max(pen2.low, pen3.low)
                 
                 if zg >= zd + min_price_overlap
                     bool is_covered = false
@@ -833,7 +943,9 @@ check_and_build_centers() =>
                                 break
                     
                     if not is_covered
+                        // GG = 中枢组件中的最高点
                         float center_gg = math.max(pen1.high, math.max(pen2.high, pen3.high))
+                        // DD = 中枢组件中的最低点
                         float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
                         int end_idx = i + 3
                         
@@ -852,8 +964,6 @@ check_and_build_centers() =>
                                 else
                                     break
                         
-                        // 判断中枢方向（基于进入笔）
-                        int center_dir = pen_in.direction == -1 ? -1 : 1
                         bool is_closed = end_idx + 1 < pen_count
 
                         first_pen = array.get(pens, i + 1)
@@ -918,8 +1028,34 @@ check_and_build_centers() =>
                 curr.extended := true
                 next.extended := true
             idx := idx + 1
-    
+
     // 处理买卖点信号 - 在主流程中处理
+    true
+
+// === 中枢检测与构建 ===
+// 根据配置选择使用笔中枢或线段中枢
+check_and_build_centers() =>
+    // 清理所有现有中枢
+    if array.size(pen_centers) > 0
+        for i = 0 to array.size(pen_centers) - 1
+            center = array.get(pen_centers, i)
+            safe_delete_box(center.box_id)
+        array.clear(pen_centers)
+
+    // 清理旧的交易信号
+    if array.size(trade_signals) > 0
+        for i = 0 to array.size(trade_signals) - 1
+            sig = array.get(trade_signals, i)
+            safe_delete_label(sig.label_id)
+        array.clear(trade_signals)
+
+    // 根据中枢类型选择构建方法
+    if zs_type == '笔中枢'
+        // 使用笔作为次级别构建中枢
+        build_pen_centers()
+    else
+        // 使用线段作为次级别构建中枢
+        build_segment_centers()
     true
 
 // === 清理函数（笔变化时调用）===
@@ -1463,7 +1599,7 @@ if barstate.islast
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
 // === 信息表格 (白色主题) ===
-var table info_table = table.new(position.top_right, 2, 16, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
+var table info_table = table.new(position.top_right, 2, 17, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
     // 白色主题颜色配置
     color title_bg = #f5f5f5      // 浅灰背景
@@ -1492,22 +1628,24 @@ if barstate.islast
     // 算法设置
     table.cell(info_table, 0, 6, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 6, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 7, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 7, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 8, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 8, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 7, "中枢类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 7, zs_type, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 8, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 8, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 9, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 9, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
 
     // 功能开关
-    table.cell(info_table, 0, 9, "线段", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 9, segment_enabled ? "✓" : "✗", text_color = segment_enabled ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 10, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 10, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 11, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 11, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 12, "买卖点类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 12, bsp_types, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 13, "严格3类", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 13, bsp_strict_3 ? "✓" : "✗", text_color = bsp_strict_3 ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 10, "线段", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 10, segment_enabled ? "✓" : "✗", text_color = segment_enabled ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 11, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 11, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 12, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 12, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 13, "买卖点类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 13, bsp_types, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 14, "严格3类", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 14, bsp_strict_3 ? "✓" : "✗", text_color = bsp_strict_3 ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
 
     // 扩展中枢统计
     int ext_count = 0
@@ -1515,8 +1653,8 @@ if barstate.islast
         c = array.get(pen_centers, i)
         if c.extended
             ext_count := ext_count + 1
-    table.cell(info_table, 0, 14, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 14, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 15, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 15, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
 
     // 最新信号
     if array.size(trade_signals) > 0
@@ -1535,8 +1673,9 @@ if barstate.islast
         else if latest_sig.type == -3
             sig_name := "3卖"
 
-        table.cell(info_table, 0, 15, "最新信号", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_table, 1, 15, sig_name, text_color = latest_sig.type > 0 ? on_text : warning_text, bgcolor = value_bg, text_size = size.small)
+        table.cell(info_table, 0, 16, "最新信号", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_table, 1, 16, sig_name, text_color = latest_sig.type > 0 ? on_text : warning_text, bgcolor = value_bg, text_size = size.small)
+
 
 // === 最终绘制管理 ===
 // 按优先级管理所有绘图对象
