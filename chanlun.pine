@@ -6,16 +6,39 @@ pen_algo = input.string('老笔', title = '画笔算法', options = ['老笔', '
 min_pen_bars = input.int(5, title = '笔最小K线数', minval = 3, maxval = 10, tooltip = '一笔至少需要的合并K线数量')
 gap_as_kl = input.bool(true, title = '缺口视为K线', tooltip = '如果两根K线之间有缺口，缺口可视为额外一根K线')
 bi_end_is_peak = input.bool(true, title = '笔端点必须是极值', tooltip = '笔的结束点必须是笔内的最高/最低点')
-show_pen_center = input.bool(true, title = '显示笔中枢')
-show_fractal_labels = input.bool(false, title = '显示顶底分型标签')
-show_divergence_signals = input.bool(true, title = '显示背驰信号')
-show_trade_signals = input.bool(true, title = '显示1/2/3买卖点')
-divergence_ratio = input.float(0.7, title = 'MACD力度减弱比例(<=该值判背驰)', minval = 0.1, maxval = 1.0, step = 0.05)
-use_slope_divergence = input.bool(true, title = '使用笔力度（幅度/天数）判背驰')
+
+// 线段设置
+segment_enabled = input.bool(false, title = '启用线段', tooltip = '启用线段作为笔和中枢之间的中间层')
+
+// 中枢设置
 zs_algo = input.string('3笔中枢', title = '中枢算法', options = ['3笔中枢', '5笔中枢'], tooltip = '3笔中枢：连续3笔直接构成中枢；5笔中枢：需要进入笔+3笔+离开笔')
+zs_one_bi = input.bool(false, title = '单笔中枢', tooltip = '允许单笔形成中枢')
 zs_combine = input.bool(true, title = '中枢合并', tooltip = '相邻中枢有重叠时合并为更大中枢')
 min_price_overlap_input = input.float(1.0, title = "中枢最小价格重叠", step = 0.5)
 min_price_overlap = min_price_overlap_input * syminfo.mintick
+
+// 买卖点设置
+bsp_enabled = input.bool(true, title = '启用买卖点')
+bsp_types = input.string('1,2,3a,3b', title = '买卖点类型', options = ['1,2,3a,3b', '1,2,3a,1p,2s,3b'], tooltip = '选择要检测的买卖点类型')
+bsp_1_only_multi = input.bool(false, title = '1类买卖点仅多笔中枢', tooltip = '只在多笔中枢中寻找1类买卖点')
+bsp_strict_3 = input.bool(false, title = '严格3类买卖点', tooltip = '使用严格的3类买卖点定义')
+
+// 背驰检测
+divergence_enabled = input.bool(true, title = '启用背驰检测')
+divergence_algo = input.string('area', title = '背驰算法', options = ['area', 'peak', 'slope'], tooltip = '面积法、峰值法或斜率法')
+divergence_rate = input.float(0.8, title = '背驰阈值', minval = 0.1, maxval = 1.0, step = 0.05, tooltip = '背驰判断阈值')
+use_slope_divergence = input.bool(true, title = '使用笔力度（幅度/天数）判背驰')
+
+// 显示设置
+show_pen_center = input.bool(true, title = '显示笔中枢')
+show_segments = input.bool(true, title = '显示线段')
+show_centers = input.bool(true, title = '显示中枢')
+show_fractal_labels = input.bool(false, title = '显示顶底分型标签')
+show_divergence_signals = input.bool(true, title = '显示背驰信号')
+show_trade_signals = input.bool(true, title = '显示买卖点')
+show_labels = input.bool(true, title = '显示价格标签')
+show_info_table = input.bool(true, title = '显示信息表')
+max_display_items = input.int(50, title = '最大显示数量', maxval = 50)
 
 // MACD参数
 macd_fast = input.int(12, title = 'MACD快线周期', minval = 1)
@@ -67,11 +90,26 @@ type Pen
     float amplitude  // 笔幅（价格变化）
     float slope      // 笔力度（幅度/天数）
 
+type Segment
+    int start_pen_idx
+    int end_pen_idx
+    float high
+    float low
+    int direction  // 1=向上线段, -1=向下线段
+    int start_time
+    int end_time
+    int start_bar_idx
+    int end_bar_idx
+    line line_id
+    bool broken    // 是否被突破
+    bool confirmed // 是否已确认
+
 type PenCenter
     float high      // ZG = min(高点1, 高点2)
     float low       // ZD = max(低点1, 低点2)
     float gg        // 中枢最高点
     float dd        // 中枢最低点
+    float mid       // 中枢中轴
     int start_time
     int end_time
     int start_pen_idx
@@ -80,14 +118,19 @@ type PenCenter
     bool closed     // 中枢是否已封闭
     int direction   // 1=上涨中枢, -1=下跌中枢
     bool extended   // 是否扩展为更大级别中枢
+    int level       // 中枢级别
+    bool is_breakout // 是否已突破
+    float breakout_price // 突破价格
 
 type TradeSignal
-    int type        // 1=1买, 2=2买, 3=3买, -1=1卖, -2=2卖, -3=3卖
+    int type        // 1=1买, 1p=1买增强, 2=2买, 2s=2买增强, 3a=3买a类, 3b=3买b类, negative for sell
+    int level       // 买卖点级别
     int bar_idx
     int time
     float price
     int ref_pen_idx
     int ref_center_idx
+    string reason   // 产生原因
     label label_id
 
 // === 全局变量 ===
@@ -95,6 +138,7 @@ var kx_array = array.new<Kx>()
 var pen_fractals = array.new<Fx>()
 var pen_lines = array.new<line>()
 var pens = array.new<Pen>()
+var segments = array.new<Segment>()
 var pen_centers = array.new<PenCenter>()
 var trade_signals = array.new<TradeSignal>()
 var Kx current_kx = na
@@ -121,6 +165,70 @@ safe_delete_label(l) =>
 safe_delete_line(l) =>
     if not na(l)
         line.delete(l)
+
+// === 绘图对象管理 ===
+// 清理旧的绘图对象以保持在限制范围内
+cleanup_drawing_objects() =>
+    // 清理多余的笔线
+    while array.size(pen_lines) > max_display_items
+        line.delete(array.shift(pen_lines))
+
+    // 清理多余的线段
+    while array.size(segments) > max_display_items / 2
+        seg = array.shift(segments)
+        if not na(seg.line_id)
+            line.delete(seg.line_id)
+
+    // 清理过多的中枢框
+    while array.size(pen_centers) > max_display_items / 3
+        center = array.shift(pen_centers)
+        safe_delete_box(center.box_id)
+
+    // 清理过多的买卖点标签
+    int max_signals = 20
+    while array.size(trade_signals) > max_signals
+        sig = array.shift(trade_signals)
+        safe_delete_label(sig.label_id)
+
+// 按优先级显示
+draw_by_priority() =>
+    if barstate.islast
+        // 1. 确保显示最新的买卖点（最高优先级）
+        if array.size(trade_signals) > 0
+            latest_signals = array.slice(trade_signals, math.max(0, array.size(trade_signals) - 5), array.size(trade_signals))
+            for i = 0 to array.size(latest_signals) - 1
+                sig = array.get(latest_signals, i)
+                if na(sig.label_id) and show_trade_signals
+                    sig.label_id := add_trade_signal_label(sig.time, sig.price,
+                        sig.type == 101 ? "1B+" : sig.type == -101 ? "1S+" :
+                        sig.type == 202 ? "2B+" : sig.type == -202 ? "2S+" :
+                        sig.type == 1 ? "1B" : sig.type == -1 ? "1S" :
+                        sig.type == 2 ? "2B" : sig.type == -2 ? "2S" :
+                        sig.type == 3 ? "3B" : sig.type == -3 ? "3S" : "",
+                        sig.type > 0 ? 1 : -1)
+
+        // 2. 确保显示当前中枢
+        if array.size(pen_centers) > 0 and show_pen_center
+            latest_center = array.get(pen_centers, array.size(pen_centers) - 1)
+            if na(latest_center.box_id)
+                latest_center.box_id := box.new(
+                    left = latest_center.start_time,
+                    top = latest_center.high,
+                    right = latest_center.end_time,
+                    bottom = latest_center.low,
+                    bgcolor = PEN_CENTER_COLOR,
+                    border_color = PEN_COLOR,
+                    border_width = 1,
+                    xloc = xloc.bar_time)
+
+        // 3. 确保显示最近的笔
+        if array.size(pen_lines) > 0 and show_pen_center
+            int recent_count = math.min(max_display_items, array.size(pen_lines))
+            recent_lines = array.slice(pen_lines, array.size(pen_lines) - recent_count, array.size(pen_lines))
+            // 确保最近的笔线存在（已在创建时处理）
+
+        // 4. 清理多余对象
+        cleanup_drawing_objects()
 
 // 检查两根合并K线之间是否有缺口
 has_gap_between(kx1_idx, kx2_idx) =>
@@ -273,6 +381,79 @@ get_pens_overlap(pen_indices) =>
         else
             [na, na]
 
+// === 线段构建 ===
+// 使用缠论标准线段算法：线段由笔构成，当反向笔不创新高/新低时线段结束
+build_segments() =>
+    if array.size(pens) >= 3
+        // 清理旧线段
+        for i = 0 to array.size(segments) - 1
+            seg = array.get(segments, i)
+            if not na(seg.line_id)
+                line.delete(seg.line_id)
+        array.clear(segments)
+
+        int i = 0
+        while i < array.size(pens) - 2
+            pen1 = array.get(pens, i)
+            pen2 = array.get(pens, i + 1)
+            pen3 = array.get(pens, i + 2)
+
+            // 检查是否形成线段特征序列
+            if pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
+                // 上涨线段：上-下-上结构
+                if pen3.high <= pen1.high
+                    // 第三笔不创新高，可能形成线段
+                    seg_high = math.max(pen1.high, pen2.high)
+                    seg_low = math.min(pen1.low, pen2.low)
+
+                    line_id = na
+                    if show_segments
+                        line_id := line.new(
+                            x1 = pen1.start_time,
+                            y1 = pen1.low,
+                            x2 = pen2.end_time,
+                            y2 = pen2.high,
+                            color = color.new(color.purple, 0),
+                            width = 2,
+                            xloc = xloc.bar_time)
+
+                    array.push(segments, Segment.new(
+                        i, i + 1, seg_high, seg_low, 1,
+                        pen1.start_time, pen2.end_time,
+                        pen1.start_bar_idx, pen2.end_bar_idx,
+                        line_id, false, false))
+                    i := i + 2
+                else
+                    i := i + 1
+            else if pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
+                // 下跌线段：下-上-下结构
+                if pen3.low >= pen1.low
+                    // 第三笔不创新低，可能形成线段
+                    seg_high = math.max(pen1.high, pen2.high)
+                    seg_low = math.min(pen1.low, pen2.low)
+
+                    line_id = na
+                    if show_segments
+                        line_id := line.new(
+                            x1 = pen1.start_time,
+                            y1 = pen1.high,
+                            x2 = pen2.end_time,
+                            y2 = pen2.low,
+                            color = color.new(color.orange, 0),
+                            width = 2,
+                            xloc = xloc.bar_time)
+
+                    array.push(segments, Segment.new(
+                        i, i + 1, seg_high, seg_low, -1,
+                        pen1.start_time, pen2.end_time,
+                        pen1.start_bar_idx, pen2.end_bar_idx,
+                        line_id, false, false))
+                    i := i + 2
+                else
+                    i := i + 1
+            else
+                i := i + 1
+
 // === 清理所有中枢和信号 ===
 cleanup_all_centers_and_signals() =>
     // 清理中枢
@@ -296,47 +477,55 @@ cleanup_all_centers_and_signals() =>
 // 2. 第二段下跌笔的低点 < 第一段下跌笔的低点（创新低）
 // 3. 第二段下跌相比第一段出现背驰
 // 4. 底分型确认
-// 返回 [triggered, pen_idx, price]
+// 返回 [triggered, pen_idx, price, type]
 check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
     int result_pen_idx = ref_buy1_pen_idx
     float result_price = ref_buy1_price
-    
+    int signal_type = 1  // 默认1买
+
     // 需要至少3笔形成"跌-涨-跌"结构
     if pen_idx >= 2 and pen_idx < array.size(pens)
         pen3 = array.get(pens, pen_idx)      // 第二段下跌笔（当前笔）
         pen2 = array.get(pens, pen_idx - 1)  // 中间上涨笔
         pen1 = array.get(pens, pen_idx - 2)  // 第一段下跌笔
-        
+
         // 验证"跌-涨-跌"结构
         bool is_valid_structure = pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
-        
+
         // 必须是已确认的向下笔
         if is_valid_structure and pen3.confirmed
             // 条件2：创新低
             bool creates_new_low = pen3.low < pen1.low
-            
+
             if creates_new_low
                 // 条件3：背驰判断
                 // 价格背驰：第二段跌幅 ≤ 第一段跌幅
                 float drop1 = pen1.high - pen1.low  // 第一段下跌幅度
                 float drop2 = pen3.high - pen3.low  // 第二段下跌幅度
                 bool price_divergence = drop2 <= drop1
-                
+
                 // MACD背驰：第二段MACD面积 < 第一段
                 bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
-                
+
                 // 笔力度背驰（可选）
                 bool slope_divergence = false
                 if use_slope_divergence
                     slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
-                
+
+                // 判断背驰强度以区分1买和1买增强
+                float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+
                 // 满足任一背驰条件
                 if price_divergence or macd_divergence or slope_divergence
                     triggered := true
                     result_pen_idx := pen_idx
                     result_price := pen3.low
-    [triggered, result_pen_idx, result_price]
+
+                    // 判断是否为1买增强（更强烈的背驰）
+                    if macd_divergence and macd_ratio < divergence_ratio * 0.7
+                        signal_type := 101  // 1买增强编码
+    [triggered, result_pen_idx, result_price, signal_type]
 
 // === 第一类卖点检测 ===
 // 严格缠论定义：
@@ -348,42 +537,50 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
     int result_pen_idx = ref_sell1_pen_idx
     float result_price = ref_sell1_price
-    
+    int signal_type = -1  // 默认1卖
+
     // 需要至少3笔形成"涨-跌-涨"结构
     if pen_idx >= 2 and pen_idx < array.size(pens)
         pen3 = array.get(pens, pen_idx)      // 第二段上涨笔（当前笔）
         pen2 = array.get(pens, pen_idx - 1)  // 中间下跌笔
         pen1 = array.get(pens, pen_idx - 2)  // 第一段上涨笔
-        
+
         // 验证"涨-跌-涨"结构
         bool is_valid_structure = pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
-        
+
         // 必须是已确认的向上笔
         if is_valid_structure and pen3.confirmed
             // 条件2：创新高
             bool creates_new_high = pen3.high > pen1.high
-            
+
             if creates_new_high
                 // 条件3：背驰判断
                 // 价格背驰：第二段涨幅 ≤ 第一段涨幅
                 float rise1 = pen1.high - pen1.low  // 第一段上涨幅度
                 float rise2 = pen3.high - pen3.low  // 第二段上涨幅度
                 bool price_divergence = rise2 <= rise1
-                
+
                 // MACD背驰：第二段MACD面积 < 第一段
                 bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
-                
+
                 // 笔力度背驰（可选）
                 bool slope_divergence = false
                 if use_slope_divergence
                     slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
-                
+
+                // 判断背驰强度以区分1卖和1卖增强
+                float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
+
                 // 满足任一背驰条件
                 if price_divergence or macd_divergence or slope_divergence
                     triggered := true
                     result_pen_idx := pen_idx
                     result_price := pen3.high
-    [triggered, result_pen_idx, result_price]
+
+                    // 判断是否为1卖增强（更强烈的背驰）
+                    if macd_divergence and macd_ratio < divergence_ratio * 0.7
+                        signal_type := -101  // 1卖增强编码
+    [triggered, result_pen_idx, result_price, signal_type]
 
 // === 第二类买点检测 ===
 // 严格缠论定义：
@@ -394,10 +591,12 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
 // 5. 回调结束时出现底分型 → 第二类买点
 check_buy2(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
+    int signal_type = 2  // 默认2买
+
     // 需要B1存在，且当前笔在B1之后至少2笔（反弹笔+回调笔）
     if not na(ref_buy1_pen_idx) and pen_idx > ref_buy1_pen_idx + 1 and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
-        
+
         // 条件3/5：必须是向下回调笔且已确认（底分型确认）
         if pen.direction == -1 and pen.confirmed
             // 条件4：回调低点不能破B1低点
@@ -406,7 +605,12 @@ check_buy2(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                 prev_pen = array.get(pens, pen_idx - 1)
                 if prev_pen.direction == 1  // 前一笔是向上反弹
                     triggered := true
-    triggered
+
+                    // 检查是否为2买增强（更强的支撑）
+                    if pen.low > ref_buy1_price * 1.01  // 回调低点明显高于B1
+                        signal_type := 202  // 2买增强编码
+
+    [triggered, signal_type]
 
 // === 第二类卖点检测 ===
 // 严格缠论定义：
@@ -417,10 +621,12 @@ check_buy2(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
 // 5. 反弹结束时出现顶分型 → 第二类卖点
 check_sell2(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
+    int signal_type = -2  // 默认2卖
+
     // 需要S1存在，且当前笔在S1之后至少2笔（下跌笔+反弹笔）
     if not na(ref_sell1_pen_idx) and pen_idx > ref_sell1_pen_idx + 1 and pen_idx < array.size(pens)
         pen = array.get(pens, pen_idx)
-        
+
         // 条件3/5：必须是向上反弹笔且已确认（顶分型确认）
         if pen.direction == 1 and pen.confirmed
             // 条件4：反弹高点不能破S1高点
@@ -429,7 +635,12 @@ check_sell2(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                 prev_pen = array.get(pens, pen_idx - 1)
                 if prev_pen.direction == -1  // 前一笔是向下回调
                     triggered := true
-    triggered
+
+                    // 检查是否为2卖增强（更强的阻力）
+                    if pen.high < ref_sell1_price * 0.99  // 反弹高点明显低于S1
+                        signal_type := -202  // 2卖增强编码
+
+    [triggered, signal_type]
 
 // === 第三类买点检测 ===
 // 严格缠论定义：
@@ -579,17 +790,18 @@ check_and_build_centers() =>
                                             break
                                     else
                                         break
-                            
+
+                            float center_mid = (zg + zd) / 2
                             bool is_closed = end_idx + 1 < pen_count
                             last_pen = array.get(pens, end_idx)
-                            
+
                             box new_box = na
                             if show_pen_center
-                                new_box := box.new(left = pen1.start_time, top = zg, right = last_pen.end_time, bottom = zd, 
+                                new_box := box.new(left = pen1.start_time, top = zg, right = last_pen.end_time, bottom = zd,
                                      bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
-                            
-                            array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, pen1.start_time, last_pen.end_time, 
-                                 i, end_idx, new_box, is_closed, center_dir, false))
+
+                            array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, center_mid, pen1.start_time, last_pen.end_time,
+                                 i, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0))
                             i := end_idx
                 
                 i := i + 1
@@ -641,17 +853,18 @@ check_and_build_centers() =>
                         // 判断中枢方向（基于进入笔）
                         int center_dir = pen_in.direction == -1 ? -1 : 1
                         bool is_closed = end_idx + 1 < pen_count
-                        
+
                         first_pen = array.get(pens, i + 1)
                         last_pen = array.get(pens, end_idx)
-                        
+                        float center_mid = (zg + zd) / 2
+
                         box new_box = na
                         if show_pen_center
-                            new_box := box.new(left = first_pen.start_time, top = zg, right = last_pen.end_time, bottom = zd, 
+                            new_box := box.new(left = first_pen.start_time, top = zg, right = last_pen.end_time, bottom = zd,
                                  bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
-                        
-                        array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, first_pen.start_time, last_pen.end_time, 
-                             i + 1, end_idx, new_box, is_closed, center_dir, false))
+
+                        array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, center_mid, first_pen.start_time, last_pen.end_time,
+                             i + 1, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0))
                         i := end_idx
                 
                 i := i + 1
@@ -711,9 +924,34 @@ check_and_build_centers() =>
 cleanup_after_pen_change() =>
     cleanup_all_centers_and_signals()
 
+// === 性能优化 ===
+// 使用缓存变量避免重复计算
+var int last_calculated_bar = 0
+var bool needs_recalculate = true
+var int last_pen_count = 0
+var int last_center_count = 0
+
+// 检查是否需要重新计算
+if bar_index != last_calculated_bar
+    needs_recalculate := true
+    last_calculated_bar := bar_index
+else
+    needs_recalculate := false
+
+// 限制历史数据大小
+MAX_HISTORY = 1000
+if array.size(pens) > MAX_HISTORY
+    pens := array.slice(pens, array.size(pens) - MAX_HISTORY, array.size(pens))
+if array.size(pen_centers) > MAX_HISTORY / 10
+    pen_centers := array.slice(pen_centers, array.size(pen_centers) - MAX_HISTORY / 10, array.size(pen_centers))
+
 // === 主流程 ===
 // 存储当前bar的MACD值
 array.push(macd_hist_array, macd_hist)
+
+// 限制MACD历史数组大小
+if array.size(macd_hist_array) > MAX_HISTORY * 10
+    macd_hist_array := array.slice(macd_hist_array, array.size(macd_hist_array) - MAX_HISTORY * 10, array.size(macd_hist_array))
 
 if na(current_kx)
     current_kx := Kx.new(high, low, time, -1, bar_index)
@@ -880,6 +1118,10 @@ else
                                  pen_amplitude,
                                  pen_slope))
                             
+                            // 构建线段（如果启用）
+                            if segment_enabled
+                                build_segments()
+
                             // 重新计算所有中枢和买卖点
                             check_and_build_centers()
                     else
@@ -992,36 +1234,59 @@ if barstate.islast
         for i = 2 to pen_count - 1
             pen = array.get(pens, i)
             
-            if pen.confirmed
+            if pen.confirmed and bsp_enabled
                 // 检查1买
-                [buy1_triggered, new_buy1_idx, new_buy1_price] = check_buy1(i, last_buy1_pen_idx, last_buy1_price)
+                [buy1_triggered, new_buy1_idx, new_buy1_price, buy1_type] = check_buy1(i, last_buy1_pen_idx, last_buy1_price)
                 if buy1_triggered
                     last_buy1_pen_idx := new_buy1_idx
                     last_buy1_price := new_buy1_price
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "1B", 1)
-                    array.push(trade_signals, TradeSignal.new(1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, lb))
-                
+
+                    // 根据类型显示不同标签
+                    string label_text = buy1_type == 101 ? "1B+" : "1B"
+                    int signal_type = buy1_type == 101 ? 101 : 1
+                    string reason = buy1_type == 101 ? "Type 1 Buy Enhanced" : "Type 1 Buy"
+
+                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1)
+                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+
                 // 检查1卖
-                [sell1_triggered, new_sell1_idx, new_sell1_price] = check_sell1(i, last_sell1_pen_idx, last_sell1_price)
+                [sell1_triggered, new_sell1_idx, new_sell1_price, sell1_type] = check_sell1(i, last_sell1_pen_idx, last_sell1_price)
                 if sell1_triggered
                     last_sell1_pen_idx := new_sell1_idx
                     last_sell1_price := new_sell1_price
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "1S", -1)
-                    array.push(trade_signals, TradeSignal.new(-1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, lb))
-                
+
+                    string label_text = sell1_type == -101 ? "1S+" : "1S"
+                    int signal_type = sell1_type == -101 ? -101 : -1
+                    string reason = sell1_type == -101 ? "Type 1 Sell Enhanced" : "Type 1 Sell"
+
+                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1)
+                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+
                 // 检查2买
-                if check_buy2(i, last_buy1_pen_idx, last_buy1_price)
+                [buy2_triggered, buy2_type] = check_buy2(i, last_buy1_pen_idx, last_buy1_price)
+                if buy2_triggered
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "2B", 1)
-                    array.push(trade_signals, TradeSignal.new(2, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, lb))
-                
+
+                    string label_text = buy2_type == 202 ? "2B+" : "2B"
+                    int signal_type = buy2_type == 202 ? 202 : 2
+                    string reason = buy2_type == 202 ? "Type 2 Buy Enhanced" : "Type 2 Buy"
+
+                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1)
+                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
+
                 // 检查2卖
-                if check_sell2(i, last_sell1_pen_idx, last_sell1_price)
+                [sell2_triggered, sell2_type] = check_sell2(i, last_sell1_pen_idx, last_sell1_price)
+                if sell2_triggered
                     end_fx = array.get(pen_fractals, pen.end_fx_idx)
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "2S", -1)
-                    array.push(trade_signals, TradeSignal.new(-2, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, lb))
+
+                    string label_text = sell2_type == -202 ? "2S+" : "2S"
+                    int signal_type = sell2_type == -202 ? -202 : -2
+                    string reason = sell2_type == -202 ? "Type 2 Sell Enhanced" : "Type 2 Sell"
+
+                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1)
+                    array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
                 
                 // 检查3买
                 if check_buy3(i)
@@ -1070,7 +1335,7 @@ if barstate.islast
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
 // === 信息表格 (白色主题) ===
-var table info_table = table.new(position.top_right, 2, 11, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
+var table info_table = table.new(position.top_right, 2, 16, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
     // 白色主题颜色配置
     color title_bg = #f5f5f5      // 浅灰背景
@@ -1081,33 +1346,71 @@ if barstate.islast
     color warning_text = #d32f2f   // 红色警告
     color on_text = #4caf50       // 开启状态
     color off_text = #9e9e9e      // 关闭状态
-    
+
+    // 基础统计
     table.cell(info_table, 0, 0, "合并K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 0, str.tostring(array.size(kx_array)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
     table.cell(info_table, 0, 1, "分型数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 1, str.tostring(array.size(pen_fractals)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
     table.cell(info_table, 0, 2, "笔数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 2, str.tostring(array.size(pens)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 3, "中枢数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 3, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 4, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 4, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 5, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 5, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 6, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 6, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 7, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 7, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
-    // 新增参数显示
-    table.cell(info_table, 0, 8, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 8, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 9, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 9, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    // 显示扩展/合并中枢数量
+    table.cell(info_table, 0, 3, "线段数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 3, str.tostring(array.size(segments)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 4, "中枢数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 4, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 5, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 5, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
+
+    // 算法设置
+    table.cell(info_table, 0, 6, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 6, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 7, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 7, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 8, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 8, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+
+    // 功能开关
+    table.cell(info_table, 0, 9, "线段", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 9, segment_enabled ? "✓" : "✗", text_color = segment_enabled ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 10, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 10, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 11, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 11, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 12, "买卖点类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 12, bsp_types, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 13, "严格3类", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 13, bsp_strict_3 ? "✓" : "✗", text_color = bsp_strict_3 ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+
+    // 扩展中枢统计
     int ext_count = 0
     for i = 0 to array.size(pen_centers) - 1
         c = array.get(pen_centers, i)
         if c.extended
             ext_count := ext_count + 1
-    table.cell(info_table, 0, 10, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 10, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 14, "扩展中枢", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 14, str.tostring(ext_count), text_color = ext_count > 0 ? warning_text : value_text, bgcolor = value_bg, text_size = size.small)
+
+    // 最新信号
+    if array.size(trade_signals) > 0
+        latest_sig = array.get(trade_signals, array.size(trade_signals) - 1)
+        string sig_name = ""
+        if latest_sig.type == 1 or latest_sig.type == 101
+            sig_name := latest_sig.type == 101 ? "1B+" : "1B"
+        else if latest_sig.type == -1 or latest_sig.type == -101
+            sig_name := latest_sig.type == -101 ? "1S+" : "1S"
+        else if latest_sig.type == 2 or latest_sig.type == 202
+            sig_name := latest_sig.type == 202 ? "2B+" : "2B"
+        else if latest_sig.type == -2 or latest_sig.type == -202
+            sig_name := latest_sig.type == -202 ? "2S+" : "2S"
+        else if latest_sig.type == 3
+            sig_name := "3B"
+        else if latest_sig.type == -3
+            sig_name := "3S"
+
+        table.cell(info_table, 0, 15, "最新信号", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_table, 1, 15, sig_name, text_color = latest_sig.type > 0 ? on_text : warning_text, bgcolor = value_bg, text_size = size.small)
+
+// === 最终绘制管理 ===
+// 按优先级管理所有绘图对象
+if barstate.islast
+    draw_by_priority()
