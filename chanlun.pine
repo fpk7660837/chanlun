@@ -166,6 +166,22 @@ safe_delete_line(l) =>
     if not na(l)
         line.delete(l)
 
+// 添加交易信号标签
+add_trade_signal_label(t, price, txt, sig_type, tooltip = "") =>
+    label lb = na
+    if show_trade_signals
+        lb := label.new(
+             x = t,
+             y = price,
+             text = txt,
+             color = sig_type > 0 ? color.green : color.red,
+             textcolor = color.white,
+             style = sig_type > 0 ? label.style_label_up : label.style_label_down,
+             size = size.small,
+             xloc = xloc.bar_time,
+             tooltip = tooltip)
+    lb
+
 // === 绘图对象管理 ===
 // 清理旧的绘图对象以保持在限制范围内
 cleanup_drawing_objects() =>
@@ -297,22 +313,6 @@ calc_macd_area(start_bar, end_bar, dir) =>
                     area += math.abs(hist_val)
     area
 
-// 添加交易信号标签
-add_trade_signal_label(t, price, txt, sig_type, tooltip = "") =>
-    label lb = na
-    if show_trade_signals
-        lb := label.new(
-             x = t,
-             y = price,
-             text = txt,
-             color = sig_type > 0 ? color.green : color.red,
-             textcolor = color.white,
-             style = sig_type > 0 ? label.style_label_up : label.style_label_down,
-             size = size.small,
-             xloc = xloc.bar_time,
-             tooltip = tooltip)
-    lb
-
 // === 背驰检测 ===
 // 检测笔的背驰：比较两段同向笔的MACD面积和笔力度
 detect_bi_divergence(current_pen_idx) =>
@@ -351,14 +351,14 @@ detect_bi_divergence(current_pen_idx) =>
             
             // MACD背驰：价格创新极值但MACD力度减弱
             if price_new_extreme and area_prev > 0
-                if area_current < area_prev * divergence_ratio
+                if area_current < area_prev * divergence_rate
                     macd_div := true
             
             // 笔力度背驰（参考Rust实现）：笔天数>=前笔 且 (笔幅<前笔 或 笔力度<前笔)
             if use_slope_divergence and price_new_extreme
                 bool bars_longer = current_pen.kx_count >= prev_pen.kx_count
                 bool amp_weaker = current_pen.amplitude < prev_pen.amplitude
-                bool slope_weaker = current_pen.slope < prev_pen.slope * divergence_ratio
+                bool slope_weaker = current_pen.slope < prev_pen.slope * divergence_rate
                 if bars_longer and (amp_weaker or slope_weaker)
                     slope_div := true
             
@@ -422,7 +422,7 @@ build_segments() =>
                     seg_high = math.max(pen1.high, pen2.high)
                     seg_low = math.min(pen1.low, pen2.low)
 
-                    line_id = na
+                    line line_id = na
                     if show_segments
                         line_id := line.new(
                             x1 = pen1.start_time,
@@ -448,7 +448,7 @@ build_segments() =>
                     seg_high = math.max(pen1.high, pen2.high)
                     seg_low = math.min(pen1.low, pen2.low)
 
-                    line_id = na
+                    line line_id = na
                     if show_segments
                         line_id := line.new(
                             x1 = pen1.start_time,
@@ -522,12 +522,12 @@ check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                 bool price_divergence = drop2 <= drop1
 
                 // MACD背驰：第二段MACD面积 < 第一段
-                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
+                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_rate
 
                 // 笔力度背驰（可选）
                 bool slope_divergence = false
                 if use_slope_divergence
-                    slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
+                    slope_divergence := pen3.slope <= pen1.slope * divergence_rate
 
                 // 判断背驰强度以区分1买和1买增强
                 float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
@@ -539,7 +539,7 @@ check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                     result_price := pen3.low
 
                     // 判断是否为1买增强（更强烈的背驰）
-                    if macd_divergence and macd_ratio < divergence_ratio * 0.7
+                    if macd_divergence and macd_ratio < divergence_rate * 0.7
                         signal_type := 101  // 1买增强编码
     [triggered, result_pen_idx, result_price, signal_type]
 
@@ -577,12 +577,12 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                 bool price_divergence = rise2 <= rise1
 
                 // MACD背驰：第二段MACD面积 < 第一段
-                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_ratio
+                bool macd_divergence = pen3.macd_area < pen1.macd_area * divergence_rate
 
                 // 笔力度背驰（可选）
                 bool slope_divergence = false
                 if use_slope_divergence
-                    slope_divergence := pen3.slope <= pen1.slope * divergence_ratio
+                    slope_divergence := pen3.slope <= pen1.slope * divergence_rate
 
                 // 判断背驰强度以区分1卖和1卖增强
                 float macd_ratio = pen1.macd_area > 0 ? pen3.macd_area / pen1.macd_area : 1.0
@@ -594,7 +594,7 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                     result_price := pen3.high
 
                     // 判断是否为1卖增强（更强烈的背驰）
-                    if macd_divergence and macd_ratio < divergence_ratio * 0.7
+                    if macd_divergence and macd_ratio < divergence_rate * 0.7
                         signal_type := -101  // 1卖增强编码
     [triggered, result_pen_idx, result_price, signal_type]
 
@@ -1283,7 +1283,7 @@ if barstate.islast
                                    "\n" +
                                    "背驰分析:" + "\n" +
                                    "• MACD面积比: " + str.tostring(math.round(macd_ratio * 100)) + "%" + "\n" +
-                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_ratio * 70)) + "%" + "\n" +
+                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_rate * 70)) + "%" + "\n" +
                                    "• 背驰强度: 强背驰" + "\n" +
                                    "\n" +
                                    "详细数据:" + "\n" +
@@ -1303,7 +1303,7 @@ if barstate.islast
                                    "\n" +
                                    "背驰分析:" + "\n" +
                                    "• 价格新低: " + str.tostring(math.round(pen3.low, 2)) + " < " + str.tostring(math.round(pen1.low, 2)) + "\n" +
-                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_ratio ? "是" : "否") + "\n" +
+                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_rate ? "是" : "否") + "\n" +
                                    "• 价格背驰: " + (drop2 <= drop1 ? "是" : "否") + "\n" +
                                    "\n" +
                                    "详细数据:" + "\n" +
@@ -1312,7 +1312,7 @@ if barstate.islast
                                    "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
                                    "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4))
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
                     array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
 
                 // 检查1卖
@@ -1346,7 +1346,7 @@ if barstate.islast
                                    "\n" +
                                    "背驰分析:" + "\n" +
                                    "• MACD面积比: " + str.tostring(math.round(macd_ratio * 100)) + "%" + "\n" +
-                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_ratio * 70)) + "%" + "\n" +
+                                   "• 背驰阈值: <" + str.tostring(math.round(divergence_rate * 70)) + "%" + "\n" +
                                    "• 背驰强度: 强背驰" + "\n" +
                                    "\n" +
                                    "详细数据:" + "\n" +
@@ -1366,7 +1366,7 @@ if barstate.islast
                                    "\n" +
                                    "背驰分析:" + "\n" +
                                    "• 价格新高: " + str.tostring(math.round(pen3.high, 2)) + " > " + str.tostring(math.round(pen1.high, 2)) + "\n" +
-                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_ratio ? "是" : "否") + "\n" +
+                                   "• MACD背驰: " + (pen3.macd_area < pen1.macd_area * divergence_rate ? "是" : "否") + "\n" +
                                    "• 价格背驰: " + (rise2 <= rise1 ? "是" : "否") + "\n" +
                                    "\n" +
                                    "详细数据:" + "\n" +
@@ -1375,7 +1375,7 @@ if barstate.islast
                                    "• 第2笔MACD: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
                                    "• 第1笔MACD: " + str.tostring(math.round(pen1.macd_area, 4))
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
                     array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
 
                 // 检查2买
@@ -1430,7 +1430,7 @@ if barstate.islast
                                    "• 反弹笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
                                    "• 回调笔天数: " + str.tostring(pen.kx_count)
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, 1, tooltip)
                     array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
 
                 // 检查2卖
@@ -1485,7 +1485,7 @@ if barstate.islast
                                    "• 下跌笔天数: " + str.tostring(prev_pen.kx_count) + "\n" +
                                    "• 反弹笔天数: " + str.tostring(pen.kx_count)
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, label_text, -1, tooltip)
                     array.push(trade_signals, TradeSignal.new(signal_type, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, reason, lb))
                 
                 // 检查3买
@@ -1527,7 +1527,7 @@ if barstate.islast
                                    "• 回抽低点距离中枢: " + str.tostring(math.round(pen.low - ref_center.high, 2)) + "\n" +
                                    "• 严格模式: " + (bsp_strict_3 ? "开启" : "关闭")
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "3B", 1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3B", 1, tooltip)
                     array.push(trade_signals, TradeSignal.new(3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "Type 3 Buy", lb))
 
                 // 检查3卖
@@ -1569,7 +1569,7 @@ if barstate.islast
                                    "• 反弹高点距离中枢: " + str.tostring(math.round(ref_center.low - pen.high, 2)) + "\n" +
                                    "• 严格模式: " + (bsp_strict_3 ? "开启" : "关闭")
 
-                    lb = add_trade_signal_label(end_fx.time, end_fx.price, "3S", -1, tooltip)
+                    label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3S", -1, tooltip)
                     array.push(trade_signals, TradeSignal.new(-3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "Type 3 Sell", lb))
     
     // 显示背驰信号
