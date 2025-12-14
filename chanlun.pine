@@ -864,6 +864,7 @@ build_pen_centers() =>
                     // DD = 中枢组件中的最低点
                     float center_dd = math.min(pen1.low, math.min(pen2.low, pen3.low))
 
+                    // 检查价格重叠是否满足最小要求
                     if zg >= zd + min_price_overlap
                         // 检查当前笔是否已被之前的中枢完全覆盖
                         // 同级别分解：只检查起始笔是否被覆盖，允许共享边界笔
@@ -888,6 +889,7 @@ build_pen_centers() =>
                                     if enters_zs
                                         float new_zg = math.min(zg, ext_pen.high)
                                         float new_zd = math.max(zd, ext_pen.low)
+                                        // 检查延伸后的价格重叠是否满足最小要求
                                         if new_zg >= new_zd + min_price_overlap
                                             zg := new_zg
                                             zd := new_zd
@@ -941,38 +943,44 @@ build_pen_centers() =>
                 pen2 = array.get(pens, i + 2)
                 pen3 = array.get(pens, i + 3)
 
-                // 验证结构：进入笔+中枢必须方向相反
+                // 验证结构：5笔中枢 = 进入笔 + 中枢内3笔
+                // 笔是交替的，所以：进入笔(方向A) → 中枢3笔(方向B-A-B)
                 bool valid_structure = false
                 int center_dir = 0
 
-                // 进入笔向下 → 上涨中枢（中枢内部是下-上-下）
-                if pen_in.direction == -1 and pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
+                // 上涨中枢：进入笔向下 → 中枢(上-下-上)
+                // 笔序列：下(进入) - 上 - 下 - 上
+                if pen_in.direction == -1 and pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
                     valid_structure := true
-                    center_dir := 1
-                // 进入笔向上 → 下跌中枢（中枢内部是上-下-上）
-                else if pen_in.direction == 1 and pen1.direction == 1 and pen2.direction == -1 and pen3.direction == 1
+                    center_dir := 1  // 上涨中枢
+                // 下跌中枢：进入笔向上 → 中枢(下-上-下)
+                // 笔序列：上(进入) - 下 - 上 - 下
+                else if pen_in.direction == 1 and pen1.direction == -1 and pen2.direction == 1 and pen3.direction == -1
                     valid_structure := true
-                    center_dir := -1
+                    center_dir := -1  // 下跌中枢
 
                 if valid_structure
                     // 根据缠论正确定义计算中枢
-                    // 中枢由pen1, pen2, pen3三笔构成
+                    // 5笔中枢：中枢由pen1, pen2, pen3三笔构成
                     // ZG = min(g1, g2) - 前两个高点的较小者
                     // ZD = max(d1, d2) - 前两个低点的较大者
                     float zg = 0.0
                     float zd = 0.0
 
-                    if center_dir == 1  // 上涨中枢：中枢为下-上-下
-                        // g1 = pen2.high, g2 = pen3.high
-                        // d1 = pen1.low, d2 = pen2.low
-                        zg := math.min(pen2.high, pen3.high)
+                    if center_dir == 1  // 上涨中枢：笔序列为 下-上-下-上
+                        // 中枢内部：pen1(上), pen2(下), pen3(上)
+                        // g1 = pen1.high, g2 = pen3.high（两个向上笔的高点）
+                        // d1 = pen1.low, d2 = pen2.low（pen1向上笔的低点，pen2向下笔的低点）
+                        zg := math.min(pen1.high, pen3.high)
                         zd := math.max(pen1.low, pen2.low)
-                    else  // 下跌中枢：中枢为上-下-上
-                        // g1 = pen1.high, g2 = pen2.high
-                        // d1 = pen2.low, d2 = pen3.low
+                    else  // 下跌中枢：笔序列为 上-下-上-下
+                        // 中枢内部：pen1(下), pen2(上), pen3(下)
+                        // g1 = pen1.high, g2 = pen2.high（pen1向下笔的高点，pen2向上笔的高点）
+                        // d1 = pen1.low, d2 = pen3.low（两个向下笔的低点）
                         zg := math.min(pen1.high, pen2.high)
-                        zd := math.max(pen2.low, pen3.low)
+                        zd := math.max(pen1.low, pen3.low)
 
+                    // 检查价格重叠是否满足最小要求
                     if zg >= zd + min_price_overlap
                         // 检查当前笔是否已被之前的中枢完全覆盖
                         // 同级别分解：只检查起始笔是否被覆盖，允许共享边界笔
@@ -1001,6 +1009,7 @@ build_pen_centers() =>
                                     if enters_zs
                                         float new_zg = math.min(zg, ext_pen.high)
                                         float new_zd = math.max(zd, ext_pen.low)
+                                        // 检查延伸后的价格重叠是否满足最小要求
                                         if new_zg >= new_zd + min_price_overlap
                                             zg := new_zg
                                             zd := new_zd
@@ -1373,6 +1382,19 @@ else
 if barstate.islast
     pen_count = array.size(pens)
 
+    // 强制确认最后一笔(在最后一根K线时)
+    // 这样可以确保有足够的已确认笔用于构建中枢和检测买卖点
+    if array.size(pens) > 0
+        last_pen = array.last(pens)
+        if not last_pen.confirmed
+            last_pen.confirmed := true
+            // 将最后一笔改为实线
+            if array.size(pen_lines) > 0
+                line.set_style(array.last(pen_lines), line.style_solid)
+
+    // 重新构建所有中枢（确保在最后一根K线时中枢被正确构建）
+    check_and_build_centers()
+
     // 清理旧的交易信号
     if array.size(trade_signals) > 0
         for i = 0 to array.size(trade_signals) - 1
@@ -1614,7 +1636,7 @@ if barstate.islast
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
 // === 信息表格 (白色主题) ===
-var table info_table = table.new(position.top_right, 2, 20, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
+var table info_table = table.new(position.top_right, 2, 15, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
     // 白色主题颜色配置
     color title_bg = #f5f5f5      // 浅灰背景
@@ -1666,30 +1688,7 @@ if barstate.islast
     table.cell(info_table, 1, 11, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
     table.cell(info_table, 0, 12, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 12, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 13, "买卖点类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 13, bsp_types, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 14, "严格3类", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 14, bsp_strict_3 ? "✓" : "✗", text_color = bsp_strict_3 ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
 
-    // 最新信号
-    if array.size(trade_signals) > 0
-        latest_sig = array.get(trade_signals, array.size(trade_signals) - 1)
-        string sig_name = ""
-        if latest_sig.type == 1
-            sig_name := "1买"
-        else if latest_sig.type == -1
-            sig_name := "1卖"
-        else if latest_sig.type == 2
-            sig_name := "2买"
-        else if latest_sig.type == -2
-            sig_name := "2卖"
-        else if latest_sig.type == 3
-            sig_name := "3买"
-        else if latest_sig.type == -3
-            sig_name := "3卖"
-
-        table.cell(info_table, 0, 15, "最新信号", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_table, 1, 15, sig_name, text_color = latest_sig.type > 0 ? on_text : warning_text, bgcolor = value_bg, text_size = size.small)
 
 
 // === 最终绘制管理 ===
