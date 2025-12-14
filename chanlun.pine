@@ -48,6 +48,16 @@ PEN_DOWN_COLOR = color.new(color.green, 0)
 PEN_CENTER_COLOR = color.new(color.blue, 80)
 PEN_WIDTH = 2
 
+// 买卖点颜色
+BUY1_CONSOLIDATION_COLOR = color.new(color.orange, 0)  // 盘整一买
+BUY1_TREND_COLOR = color.new(color.fuchsia, 0)        // 趋势一买
+SELL1_CONSOLIDATION_COLOR = color.new(color.purple, 0) // 盘整一卖
+SELL1_TREND_COLOR = color.new(color.maroon, 0)        // 趋势一卖
+BUY2_COLOR = color.new(color.yellow, 0)
+SELL2_COLOR = color.new(color.gray, 0)
+BUY3_COLOR = color.new(color.lime, 0)
+SELL3_COLOR = color.new(color.silver, 0)
+
 // === MACD计算 ===
 [macd_line, signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
 
@@ -103,6 +113,9 @@ type PenCenter
     int level       // 中枢级别
     bool is_breakout // 是否已突破
     float breakout_price // 突破价格
+    int center_type // 1=盘整中枢, 2=趋势中枢
+    int trend_level // 趋势级别（用于标识同级别分解下的层级）
+    bool is_new_trend_center // 是否为趋势的新生中枢
 
 type TradeSignal
     int type        // 1=1买, 2=2买, 3=3买, -1=1卖, -2=2卖, -3=3卖
@@ -113,6 +126,7 @@ type TradeSignal
     int ref_pen_idx
     int ref_center_idx
     string reason   // 产生原因
+    string sub_type // 子类型：consolidation(盘整), trend_divergence(趋势背驰)
     label label_id
 
 // === 全局变量 ===
@@ -251,14 +265,30 @@ should_check_bsp_type(bsp_level) =>
     should_check
 
 // 添加交易信号标签
-add_trade_signal_label(t, price, txt, sig_type, tooltip = "") =>
+add_trade_signal_label(t, price, txt, sig_type, tooltip = "", sub_type = "") =>
     label lb = na
     if show_trade_signals
+        // 根据买卖点类型和子类型选择颜色
+        color label_color = sig_type > 0 ? color.green : color.red
+
+        if sig_type == 1  // 1买
+            label_color := sub_type == "trend_divergence" ? BUY1_TREND_COLOR : BUY1_CONSOLIDATION_COLOR
+        else if sig_type == -1  // 1卖
+            label_color := sub_type == "trend_divergence" ? SELL1_TREND_COLOR : SELL1_CONSOLIDATION_COLOR
+        else if sig_type == 2  // 2买
+            label_color := BUY2_COLOR
+        else if sig_type == -2  // 2卖
+            label_color := SELL2_COLOR
+        else if sig_type == 3  // 3买
+            label_color := BUY3_COLOR
+        else if sig_type == -3  // 3卖
+            label_color := SELL3_COLOR
+
         lb := label.new(
              x = t,
              y = price,
              text = txt,
-             color = sig_type > 0 ? color.green : color.red,
+             color = label_color,
              textcolor = color.white,
              style = sig_type > 0 ? label.style_label_up : label.style_label_down,
              size = size.small,
@@ -490,18 +520,107 @@ cleanup_all_centers_and_signals() =>
         array.clear(trade_signals)
     true
 
+// === 趋势判断函数 ===
+// 判断当前市场走势类型：趋势走势还是盘整走势
+// 返回：[is_trend, trend_direction, center_pattern]
+// is_trend: true=趋势走势, false=盘整走势
+// trend_direction: 1=上涨趋势, -1=下跌趋势, 0=无趋势
+// center_pattern: 描述中枢形态的字符串
+detect_market_trend_and_centers(ref_pen_idx) =>
+    bool is_trend = false
+    int trend_direction = 0
+    string center_pattern = ""
+
+    center_count = array.size(pen_centers)
+
+    if center_count >= 2
+        // 检查最近两个中枢的关系
+        last_center = array.get(pen_centers, center_count - 1)
+        prev_center = array.get(pen_centers, center_count - 2)
+
+        // 判断是否形成趋势：中枢依次抬高或降低
+        float price_threshold = 0.005  // 0.5%的最小变化阈值
+
+        // 上涨趋势：后一个中枢的整体区间高于前一个中枢
+        if last_center.low > prev_center.high * (1 + price_threshold) and last_center.high > prev_center.high * (1 + price_threshold)
+            is_trend := true
+            trend_direction := 1
+            center_pattern := "上涨趋势：中枢依次抬高"
+
+        // 下跌趋势：后一个中枢的整体区间低于前一个中枢
+        else if last_center.high < prev_center.low * (1 - price_threshold) and last_center.low < prev_center.low * (1 - price_threshold)
+            is_trend := true
+            trend_direction := -1
+            center_pattern := "下跌趋势：中枢依次降低"
+
+        // 盘整：中枢在相近的价位区间
+        else
+            is_trend := false
+            center_pattern := "盘整走势：中枢价格重叠"
+
+    else if center_count == 1
+        // 只有一个中枢时，参考它之前的价格走势
+        center = array.get(pen_centers, 0)
+
+        // 查找中枢前的笔来判断趋势
+        if center.start_pen_idx > 0 and center.start_pen_idx - 2 >= 0
+            pre_center_pen1 = array.get(pens, center.start_pen_idx - 2)
+            pre_center_pen2 = array.get(pens, center.start_pen_idx - 1)
+
+            // 如果中枢前的两笔形成明确的趋势
+            if pre_center_pen1.high > pre_center_pen2.high * 1.02 and pre_center_pen1.low > pre_center_pen2.low * 1.02
+                is_trend := true
+                trend_direction := 1
+                center_pattern := "上涨趋势中的第一个中枢"
+            else if pre_center_pen1.high < pre_center_pen2.high * 0.98 and pre_center_pen1.low < pre_center_pen2.low * 0.98
+                is_trend := true
+                trend_direction := -1
+                center_pattern := "下跌趋势中的第一个中枢"
+            else
+                is_trend := false
+                center_pattern := "盘整走势中的中枢"
+        else
+            is_trend := false
+            center_pattern := "初始中枢"
+    else
+        // 没有中枢时
+        is_trend := false
+        center_pattern := "无中枢"
+
+    [is_trend, trend_direction, center_pattern]
+
+// 判断特定笔是否属于趋势背驰结构
+// 返回：[is_trend_divergence, trend_direction]
+is_trend_divergence_structure(pen_idx, relevant_center_idx) =>
+    bool is_trend_div = false
+    int trend_dir = 0
+
+    if array.size(pen_centers) >= 2 and relevant_center_idx > 0
+        // 检查是否是第二个或之后的中枢
+        current_center = array.get(pen_centers, relevant_center_idx)
+        prev_center = array.get(pen_centers, relevant_center_idx - 1)
+
+        // 判断趋势方向
+        if current_center.low > prev_center.high and current_center.high > prev_center.high
+            trend_dir := 1  // 上涨趋势
+            is_trend_div := true
+        else if current_center.high < prev_center.low and current_center.low < prev_center.low
+            trend_dir := -1  // 下跌趋势
+            is_trend_div := true
+        else
+            is_trend_div := false
+
+    [is_trend_div, trend_dir]
+
 // === 第一类买点检测 ===
-// 缠论原文定义：某级别下跌趋势中，一个次级别走势类型向下跌破最后一个缠中说禅走势中枢后形成的背驰点
-// 关键：
-// 1. 必须在下跌趋势中(中枢前后都有向下笔)
-// 2. 向下离开中枢，跌破ZD(中枢下沿)
-// 3. 与前一个离开中枢的向下笔相比形成背驰
-// 返回 [triggered, pen_idx, price, type]
+// 区分盘整一买和趋势背驰一买
+// 返回 [triggered, pen_idx, price, type, sub_type]
 check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
     bool triggered = false
     int result_pen_idx = ref_buy1_pen_idx
     float result_price = ref_buy1_price
     int signal_type = 1  // 1买
+    string sub_type = ""
 
     // 需要至少有一个中枢
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -532,8 +651,11 @@ check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                     center_valid := center_pen_count >= 3
 
                 if center_valid
+                    // 判断是趋势还是盘整
+                    [is_trend, trend_dir, center_pattern] = detect_market_trend_and_centers(pen_idx)
+                    [is_trend_div, trend_direction] = is_trend_divergence_structure(pen_idx, relevant_center_idx)
+
                     // 找到进入这个中枢前的向下笔(作为背驰比较的对象)
-                    // 这应该是中枢开始之前的那个向下笔
                     int prev_down_idx = na
 
                     // 方法1：找中枢进入笔的前一笔
@@ -569,24 +691,36 @@ check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                                 slope_div := pen.slope < prev_pen.slope * divergence_rate
 
                             // 背驰条件：创新低且(MACD背驰 OR 力度背驰)
-                            // 满足任一背驰即可触发
                             if macd_div or slope_div
                                 triggered := true
                                 result_pen_idx := pen_idx
                                 result_price := pen.low
-    [triggered, result_pen_idx, result_price, signal_type]
+
+                                // 根据市场结构确定子类型
+                                if is_trend_div and trend_direction == -1
+                                    // 趋势背驰一买：第二个或之后的中枢后的背驰
+                                    sub_type := "trend_divergence"
+                                else if not is_trend and relevant_center_idx == 0
+                                    // 盘整一买：盘整走势中的第一个中枢后的背驰
+                                    sub_type := "consolidation"
+                                else if is_trend and relevant_center_idx == 0
+                                    // 趋势中的第一个中枢背驰，也算趋势背驰
+                                    sub_type := "trend_divergence"
+                                else
+                                    // 其他情况归为盘整
+                                    sub_type := "consolidation"
+
+    [triggered, result_pen_idx, result_price, signal_type, sub_type]
 
 // === 第一类卖点检测 ===
-// 缠论原文定义：某级别上涨趋势中，一个次级别走势类型向上突破最后一个缠中说禅走势中枢后形成的背驰点
-// 关键：
-// 1. 必须在上涨趋势中(中枢前后都有向上笔)
-// 2. 向上离开中枢，突破ZG(中枢上沿)
-// 3. 与前一个离开中枢的向上笔相比形成背驰
+// 区分盘整一卖和趋势背驰一卖
+// 返回 [triggered, pen_idx, price, type, sub_type]
 check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     bool triggered = false
     int result_pen_idx = ref_sell1_pen_idx
     float result_price = ref_sell1_price
     int signal_type = -1  // 1卖
+    string sub_type = ""
 
     // 需要至少有一个中枢
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -617,8 +751,11 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                     center_valid := center_pen_count >= 3
 
                 if center_valid
+                    // 判断是趋势还是盘整
+                    [is_trend, trend_dir, center_pattern] = detect_market_trend_and_centers(pen_idx)
+                    [is_trend_div, trend_direction] = is_trend_divergence_structure(pen_idx, relevant_center_idx)
+
                     // 找到进入这个中枢前的向上笔(作为背驰比较的对象)
-                    // 这应该是中枢开始之前的那个向上笔
                     int prev_up_idx = na
 
                     // 方法1：找中枢进入笔的前一笔
@@ -654,12 +791,26 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                                 slope_div := pen.slope < prev_pen.slope * divergence_rate
 
                             // 背驰条件：创新高且(MACD背驰 OR 力度背驰)
-                            // 满足任一背驰即可触发
                             if macd_div or slope_div
                                 triggered := true
                                 result_pen_idx := pen_idx
                                 result_price := pen.high
-    [triggered, result_pen_idx, result_price, signal_type]
+
+                                // 根据市场结构确定子类型
+                                if is_trend_div and trend_direction == 1
+                                    // 趋势背驰一卖：第二个或之后的中枢后的背驰
+                                    sub_type := "trend_divergence"
+                                else if not is_trend and relevant_center_idx == 0
+                                    // 盘整一卖：盘整走势中的第一个中枢后的背驰
+                                    sub_type := "consolidation"
+                                else if is_trend and relevant_center_idx == 0
+                                    // 趋势中的第一个中枢背驰，也算趋势背驰
+                                    sub_type := "trend_divergence"
+                                else
+                                    // 其他情况归为盘整
+                                    sub_type := "consolidation"
+
+    [triggered, result_pen_idx, result_price, signal_type, sub_type]
 
 // === 第二类买点检测 ===
 // 缠论原文定义：某级别中，第一类买点的次级别上涨结束后再次下跌的那个次级别走势类型的结束点
@@ -910,8 +1061,25 @@ build_pen_centers() =>
                                 new_box := box.new(left = pen1.start_time, top = zg, right = last_pen.end_time, bottom = zd,
                                      bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
 
+                            // 判断中枢类型和趋势信息
+                            int center_type_val = 1  // 默认为盘整中枢
+                            int trend_level_val = array.size(pen_centers)  // 当前层级
+                            bool is_new_trend_center_val = false
+
+                            // 如果是第一个中枢，默认为盘整中枢
+                            // 如果有多个中枢，需要判断是否形成趋势
+                            if array.size(pen_centers) > 0
+                                prev_center = array.get(pen_centers, array.size(pen_centers) - 1)
+                                // 检查是否形成趋势
+                                if center_dir == 1 and zd > prev_center.gg
+                                    center_type_val := 2  // 上涨趋势中枢
+                                    is_new_trend_center_val := true
+                                else if center_dir == -1 and zg < prev_center.dd
+                                    center_type_val := 2  // 下跌趋势中枢
+                                    is_new_trend_center_val := true
+
                             array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, center_mid, pen1.start_time, last_pen.end_time,
-                                 i, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0))
+                                 i, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0, center_type_val, trend_level_val, is_new_trend_center_val))
 
                             // 同级别分解关键修改：
                             // 允许下一个中枢从当前中枢的最后一笔开始（共享边界笔）
@@ -1032,8 +1200,25 @@ build_pen_centers() =>
                                 new_box := box.new(left = first_pen.start_time, top = zg, right = last_pen.end_time, bottom = zd,
                                      bgcolor = PEN_CENTER_COLOR, border_color = PEN_COLOR, border_width = 1, xloc = xloc.bar_time)
 
+                            // 判断中枢类型和趋势信息（5笔中枢算法）
+                            int center_type_val = 1  // 默认为盘整中枢
+                            int trend_level_val = array.size(pen_centers)  // 当前层级
+                            bool is_new_trend_center_val = false
+
+                            // 如果是第一个中枢，默认为盘整中枢
+                            // 如果有多个中枢，需要判断是否形成趋势
+                            if array.size(pen_centers) > 0
+                                prev_center = array.get(pen_centers, array.size(pen_centers) - 1)
+                                // 检查是否形成趋势（5笔中枢）
+                                if center_dir == 1 and zd > prev_center.gg
+                                    center_type_val := 2  // 上涨趋势中枢
+                                    is_new_trend_center_val := true
+                                else if center_dir == -1 and zg < prev_center.dd
+                                    center_type_val := 2  // 下跌趋势中枢
+                                    is_new_trend_center_val := true
+
                             array.push(pen_centers, PenCenter.new(zg, zd, center_gg, center_dd, center_mid, first_pen.start_time, last_pen.end_time,
-                                 i + 1, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0))
+                                 i + 1, end_idx, new_box, is_closed, center_dir, false, 1, false, 0.0, center_type_val, trend_level_val, is_new_trend_center_val))
 
                             // 同级别分解关键修改：
                             // 允许下一个中枢从当前中枢的倒数第2笔开始（共享边界笔）
@@ -1117,8 +1302,7 @@ if not current_kx_initialized
     current_kx := Kx.new(high, low, time, -1, bar_index)
     current_kx_initialized := true
 else
-    bool has_include = (high >= current_kx.high and low <= current_kx.low) or
-                       (high <= current_kx.high and low >= current_kx.low)
+    bool has_include = (high >= current_kx.high and low <= current_kx.low) or (high <= current_kx.high and low >= current_kx.low)
 
     if has_include
         // 包含关系处理
@@ -1149,10 +1333,8 @@ else
             k2 = array.get(kx_array, array.size(kx_array) - 2)
             k3 = array.get(kx_array, array.size(kx_array) - 1)
 
-            is_top = k2.high > k1.high and k2.high > k3.high and
-                     k2.low > k1.low and k2.low > k3.low
-            is_bot = k2.low < k1.low and k2.low < k3.low and
-                     k2.high < k1.high and k2.high < k3.high
+            is_top = k2.high > k1.high and k2.high > k3.high and k2.low > k1.low and k2.low > k3.low
+            is_bot = k2.low < k1.low and k2.low < k3.low and k2.high < k1.high and k2.high < k3.high
 
             if is_top or is_bot
                 new_price = is_top ? k2.high : k2.low
@@ -1417,7 +1599,7 @@ if barstate.islast
                 // 检查1买
                 bool check_type_1 = should_check_bsp_type(1)
                 if check_type_1
-                    [buy1_triggered, new_buy1_idx, new_buy1_price, buy1_type] = check_buy1(i, last_buy1_pen_idx, last_buy1_price)
+                    [buy1_triggered, new_buy1_idx, new_buy1_price, buy1_type, buy1_sub_type] = check_buy1(i, last_buy1_pen_idx, last_buy1_price)
                     if buy1_triggered
                         last_buy1_pen_idx := new_buy1_idx
                         last_buy1_price := new_buy1_price
@@ -1429,23 +1611,29 @@ if barstate.islast
                         // 获取最后一个中枢信息
                         PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
+                        // 根据子类型确定显示标签
+                        string display_label = buy1_sub_type == "trend_divergence" ? "趋势1买" : "盘整1买"
+                        string buy_type_text = buy1_sub_type == "trend_divergence" ? "趋势背驰一买" : "盘整一买"
+
                         // 生成详细的tooltip
-                        string tooltip = "【1买】" + "\n" +
+                        string tooltip = "【" + display_label + "】" + "\n" +
                                        "\n" +
-                                       "缠论定义: 某级别下跌趋势中，一个次级别走势类型向下跌破最后一个缠中说禅走势中枢后形成的背驰点" + "\n" +
+                                       buy_type_text + ": " +
+                                       (buy1_sub_type == "trend_divergence" ? "下跌趋势中第二个或之后中枢形成的背驰买点" : "盘整走势中第一个中枢后的背驰买点") + "\n" +
                                        "\n" +
                                        "生成条件:" + "\n" +
-                                       "• 跌破最后一个中枢下沿(ZD): " + str.tostring(math.round(last_center.low, 2)) + "\n" +
+                                       "• 跌破中枢下沿(ZD): " + str.tostring(math.round(last_center.low, 2)) + "\n" +
                                        "• 当前低点: " + str.tostring(math.round(pen3.low, 2)) + "\n" +
                                        "• MACD面积: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                       "• 笔力度: " + str.tostring(math.round(pen3.slope, 4))
+                                       "• 笔力度: " + str.tostring(math.round(pen3.slope, 4)) + "\n" +
+                                       "• 类型: " + buy_type_text
 
-                        label lb = add_trade_signal_label(end_fx.time, end_fx.price, "1买", 1, tooltip)
-                        array.push(trade_signals, TradeSignal.new(1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类买点", lb))
+                        label lb = add_trade_signal_label(end_fx.time, end_fx.price, display_label, 1, tooltip, buy1_sub_type)
+                        array.push(trade_signals, TradeSignal.new(1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类买点", buy1_sub_type, lb))
 
                 // 检查1卖
                 if check_type_1
-                    [sell1_triggered, new_sell1_idx, new_sell1_price, sell1_type] = check_sell1(i, last_sell1_pen_idx, last_sell1_price)
+                    [sell1_triggered, new_sell1_idx, new_sell1_price, sell1_type, sell1_sub_type] = check_sell1(i, last_sell1_pen_idx, last_sell1_price)
                     if sell1_triggered
                         last_sell1_pen_idx := new_sell1_idx
                         last_sell1_price := new_sell1_price
@@ -1457,19 +1645,25 @@ if barstate.islast
                         // 获取最后一个中枢信息
                         PenCenter last_center = array.get(pen_centers, array.size(pen_centers) - 1)
 
+                        // 根据子类型确定显示标签
+                        string display_label = sell1_sub_type == "trend_divergence" ? "趋势1卖" : "盘整1卖"
+                        string sell_type_text = sell1_sub_type == "trend_divergence" ? "趋势背驰一卖" : "盘整一卖"
+
                         // 生成详细的tooltip
-                        string tooltip = "【1卖】" + "\n" +
+                        string tooltip = "【" + display_label + "】" + "\n" +
                                        "\n" +
-                                       "缠论定义: 某级别上涨趋势中，一个次级别走势类型向上突破最后一个缠中说禅走势中枢后形成的背驰点" + "\n" +
+                                       sell_type_text + ": " +
+                                       (sell1_sub_type == "trend_divergence" ? "上涨趋势中第二个或之后中枢形成的背驰卖点" : "盘整走势中第一个中枢后的背驰卖点") + "\n" +
                                        "\n" +
                                        "生成条件:" + "\n" +
-                                       "• 突破最后一个中枢上沿(ZG): " + str.tostring(math.round(last_center.high, 2)) + "\n" +
+                                       "• 突破中枢上沿(ZG): " + str.tostring(math.round(last_center.high, 2)) + "\n" +
                                        "• 当前高点: " + str.tostring(math.round(pen3.high, 2)) + "\n" +
                                        "• MACD面积: " + str.tostring(math.round(pen3.macd_area, 4)) + "\n" +
-                                       "• 笔力度: " + str.tostring(math.round(pen3.slope, 4))
+                                       "• 笔力度: " + str.tostring(math.round(pen3.slope, 4)) + "\n" +
+                                       "• 类型: " + sell_type_text
 
-                        label lb = add_trade_signal_label(end_fx.time, end_fx.price, "1卖", -1, tooltip)
-                        array.push(trade_signals, TradeSignal.new(-1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类卖点", lb))
+                        label lb = add_trade_signal_label(end_fx.time, end_fx.price, display_label, -1, tooltip, sell1_sub_type)
+                        array.push(trade_signals, TradeSignal.new(-1, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, array.size(pen_centers) - 1, "第一类卖点", sell1_sub_type, lb))
 
                 // 检查2买
                 bool check_type_2 = should_check_bsp_type(2)
@@ -1491,7 +1685,7 @@ if barstate.islast
                                        "• 支撑有效: " + (pen.low >= last_buy1_price ? "是" : "否")
 
                         label lb = add_trade_signal_label(end_fx.time, end_fx.price, "2买", 1, tooltip)
-                        array.push(trade_signals, TradeSignal.new(2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类买点", lb))
+                        array.push(trade_signals, TradeSignal.new(2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类买点", "", lb))
 
                 // 检查2卖
                 if check_type_2
@@ -1512,7 +1706,7 @@ if barstate.islast
                                        "• 阻力有效: " + (pen.high <= last_sell1_price ? "是" : "否")
 
                         label lb = add_trade_signal_label(end_fx.time, end_fx.price, "2卖", -1, tooltip)
-                        array.push(trade_signals, TradeSignal.new(-2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类卖点", lb))
+                        array.push(trade_signals, TradeSignal.new(-2, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, na, "第二类卖点", "", lb))
 
                 // 检查3买
                 bool check_type_3 = should_check_bsp_type(3)
@@ -1556,7 +1750,7 @@ if barstate.islast
                                    "• 回抽低点距离中枢: " + str.tostring(math.round(pen.low - ref_center.high, 2))
 
                     label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3买", 1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类买点", lb))
+                    array.push(trade_signals, TradeSignal.new(3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类买点", "", lb))
 
                 // 检查3卖
                 if check_type_3 and check_sell3(i)
@@ -1599,7 +1793,7 @@ if barstate.islast
                                    "• 反弹高点距离中枢: " + str.tostring(math.round(ref_center.low - pen.high, 2))
 
                     label lb = add_trade_signal_label(end_fx.time, end_fx.price, "3卖", -1, tooltip)
-                    array.push(trade_signals, TradeSignal.new(-3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类卖点", lb))
+                    array.push(trade_signals, TradeSignal.new(-3, 1, end_fx.bar_idx, end_fx.time, end_fx.price, i, ref_center_idx, "第三类卖点", "", lb))
 
     // 显示背驰信号（已注释 - 背驰信息会显示在1买/1卖的tooltip中）
     // if show_divergence_signals and pen_count >= 3
