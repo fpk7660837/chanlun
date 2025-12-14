@@ -129,6 +129,25 @@ type TradeSignal
     string sub_type // 子类型：consolidation(盘整), trend_divergence(趋势背驰)
     label label_id
 
+// === 走势类型 ===
+// 表示完整的走势结构（a+A+b或a+A+b+B+c）
+type Trend
+    int trend_id
+    int type               // 1=上涨趋势, -1=下跌趋势, 0=盘整
+    array<int> center_ids  // 包含的中枢索引列表
+    int start_pen_idx      // 起始笔索引（a段起点）
+    int end_pen_idx        // 当前结束笔索引（b段或c段终点）
+    bool completed         // 是否完成
+    string completion_type // "背驰", "突破确认", "中枢延伸", "进行中"
+
+    // 走势段标记（用于精确定位）
+    int a_start_pen        // a段起始笔索引
+    int a_end_pen          // a段结束笔索引（进入中枢前）
+    int first_center_idx   // 第一个中枢A的索引
+    int b_start_pen        // b段起始笔索引（离开中枢后）
+    int b_end_pen          // b段结束笔索引
+    int second_center_idx  // 第二个中枢B的索引（趋势走势才有）
+
 // === 全局变量 ===
 var kx_array = array.new<Kx>()
 var pen_fractals = array.new<Fx>()
@@ -136,6 +155,7 @@ var pen_lines = array.new<line>()
 var pens = array.new<Pen>()
 var pen_centers = array.new<PenCenter>()
 var trade_signals = array.new<TradeSignal>()
+var trends = array.new<Trend>()  // 走势类型数组
 var bool current_kx_initialized = false
 var Kx current_kx = Kx.new(high, low, time, 0, bar_index)
 
@@ -612,6 +632,74 @@ is_trend_divergence_structure(pen_idx, relevant_center_idx) =>
 
     [is_trend_div, trend_dir]
 
+// === 查找背驰检测的参照笔 ===
+// 根据当前笔和中枢的关系，智能查找用于力度对比的参照笔
+// 区分趋势背驰（两个中枢）和盘整背驰（一个中枢）
+// 参数：
+//   current_pen: 当前笔对象
+//   current_pen_idx: 当前笔索引
+//   current_center: 当前相关中枢
+//   current_center_idx: 当前中枢索引
+// 返回：[reference_pen, reference_pen_idx]
+find_reference_pen(current_pen, current_pen_idx, current_center, current_center_idx) =>
+    var Pen reference_pen = na
+    int reference_pen_idx = na
+
+    // 查找当前中枢之前是否有中枢
+    var PenCenter prev_center = na
+    int prev_center_idx = na
+
+    if current_center_idx > 0
+        prev_center := array.get(pen_centers, current_center_idx - 1)
+        prev_center_idx := current_center_idx - 1
+
+    if not na(prev_center)
+        // 情况1：趋势背驰（存在前一个中枢）
+        // 找连接两个中枢之间的那段（b段）
+        // b段应该是离开prev_center并进入current_center的同向笔
+        // 策略：从current_center的起始笔向前搜索，找到最接近的同向笔
+
+        int loop_start = current_center.start_pen_idx
+        int loop_end = prev_center.end_pen_idx
+
+        // 确保循环方向正确：起点必须 > 终点（向前搜索）
+        if loop_start > loop_end
+            for i = loop_start to loop_end by -1
+                if i >= 0 and i < array.size(pens)
+                    search_pen = array.get(pens, i)
+                    // 必须是同向笔
+                    if search_pen.direction == current_pen.direction
+                        // 确保这支笔在两个中枢之间或者是进入current_center的笔
+                        // 笔的结束应该 >= prev_center的结束
+                        if search_pen.end_fx_idx >= prev_center.end_pen_idx
+                            reference_pen := search_pen
+                            reference_pen_idx := i
+                            break
+    else
+        // 情况2：盘整背驰（没有前一个中枢）
+        // 找进入当前中枢之前的同向笔
+        // 策略：从current_center起始笔向前搜索同向笔
+
+        if current_center.start_pen_idx > 0
+            int loop_start2 = current_center.start_pen_idx - 1
+            int loop_end2 = 0
+
+            // 确保有笔可以搜索（起点必须 > 终点）
+            if loop_start2 > loop_end2
+                for i = loop_start2 to loop_end2 by -1
+                    if i >= 0 and i < array.size(pens)
+                        search_pen = array.get(pens, i)
+                        // 必须是同向笔
+                        if search_pen.direction == current_pen.direction
+                            // 确保这支笔不在中枢内部
+                            // 笔的结束应该 < current_center的起始
+                            if search_pen.end_fx_idx < current_center.start_pen_idx
+                                reference_pen := search_pen
+                                reference_pen_idx := i
+                                break
+
+    [reference_pen, reference_pen_idx]
+
 // === 第一类买点检测 ===
 // 区分盘整一买和趋势背驰一买
 // 返回 [triggered, pen_idx, price, type, sub_type]
@@ -655,26 +743,10 @@ check_buy1(pen_idx, ref_buy1_pen_idx, ref_buy1_price) =>
                     [is_trend, trend_dir, center_pattern] = detect_market_trend_and_centers(pen_idx)
                     [is_trend_div, trend_direction] = is_trend_divergence_structure(pen_idx, relevant_center_idx)
 
-                    // 找到进入这个中枢前的向下笔(作为背驰比较的对象)
-                    int prev_down_idx = na
+                    // 使用新的find_reference_pen函数查找参照笔
+                    [prev_pen, prev_down_idx] = find_reference_pen(pen, pen_idx, relevant_center, relevant_center_idx)
 
-                    // 方法1：找中枢进入笔的前一笔
-                    int enter_pen_idx = relevant_center.start_pen_idx
-                    if enter_pen_idx > 0
-                        potential_prev = array.get(pens, enter_pen_idx - 1)
-                        if potential_prev.direction == -1
-                            prev_down_idx := enter_pen_idx - 1
-
-                    // 方法2：如果方法1失败，向前搜索最近的向下笔
-                    if na(prev_down_idx)
-                        for j = relevant_center.start_pen_idx - 1 to 0
-                            search_pen = array.get(pens, j)
-                            if search_pen.direction == -1
-                                prev_down_idx := j
-                                break
-
-                    if not na(prev_down_idx)
-                        prev_pen = array.get(pens, prev_down_idx)
+                    if not na(prev_down_idx) and not na(prev_pen)
 
                         // 价格必须创新低
                         bool price_new_low = pen.low < prev_pen.low
@@ -755,26 +827,10 @@ check_sell1(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
                     [is_trend, trend_dir, center_pattern] = detect_market_trend_and_centers(pen_idx)
                     [is_trend_div, trend_direction] = is_trend_divergence_structure(pen_idx, relevant_center_idx)
 
-                    // 找到进入这个中枢前的向上笔(作为背驰比较的对象)
-                    int prev_up_idx = na
+                    // 使用新的find_reference_pen函数查找参照笔
+                    [prev_pen, prev_up_idx] = find_reference_pen(pen, pen_idx, relevant_center, relevant_center_idx)
 
-                    // 方法1：找中枢进入笔的前一笔
-                    int enter_pen_idx = relevant_center.start_pen_idx
-                    if enter_pen_idx > 0
-                        potential_prev = array.get(pens, enter_pen_idx - 1)
-                        if potential_prev.direction == 1
-                            prev_up_idx := enter_pen_idx - 1
-
-                    // 方法2：如果方法1失败，向前搜索最近的向上笔
-                    if na(prev_up_idx)
-                        for j = relevant_center.start_pen_idx - 1 to 0
-                            search_pen = array.get(pens, j)
-                            if search_pen.direction == 1
-                                prev_up_idx := j
-                                break
-
-                    if not na(prev_up_idx)
-                        prev_pen = array.get(pens, prev_up_idx)
+                    if not na(prev_up_idx) and not na(prev_pen)
 
                         // 价格必须创新高
                         bool price_new_high = pen.high > prev_pen.high
@@ -873,15 +929,27 @@ check_sell2(pen_idx, ref_sell1_pen_idx, ref_sell1_price) =>
     [triggered, signal_type]
 
 // === 第三类买点检测 ===
+//
+// 核心定义：离开中枢 + 回调不破中枢 = 走势完成确认
+//
 // 缠论原文定义：
 // 一个次级别走势类型向上离开缠中说禅走势中枢，然后以一个次级别走势类型回试，
 // 其低点不跌破ZG，则构成第三类买点
-// 关键：
-// 1. 存在上涨中枢(下-上-下结构, direction = 1)
-// 2. 中枢完成后，向上突破ZG，形成离开笔
-// 3. 随后回调形成下跌笔
-// 4. 回调低点 >= ZG (不跌破中枢上沿，即不重新进入中枢)
-// 5. 回调笔结束点 → 第三类买点
+//
+// 实现要点（标准版本，不递归次级别）：
+// 1. 存在一个已完成的上涨中枢(下-上-下结构, direction = 1)
+// 2. 离开笔：向上突破中枢ZG
+// 3. 回调笔：当前向下笔回调
+// 4. 不破ZG：回调笔低点 >= ZG（不重新进入中枢区间）
+// 5. 信号点：回调笔结束点
+//
+// 意义：
+// - 盘整背景：确认向上突破有效，走势完成
+// - 趋势背景：趋势完成后的反转确认点
+//
+// 结构：
+//   中枢A → 离开笔(↑) → 回调笔(↓) → 3买
+//              ↑突破ZG      ↓不破ZG
 check_buy3(pen_idx) =>
     bool triggered = false
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -918,15 +986,27 @@ check_buy3(pen_idx) =>
     triggered
 
 // === 第三类卖点检测 ===
+//
+// 核心定义：离开中枢 + 反弹不破中枢 = 走势完成确认
+//
 // 缠论原文定义：
 // 一个次级别走势类型向下离开缠中说禅走势中枢，然后以一个次级别走势类型回试，
 // 其高点不升破ZD，则构成第三类卖点
-// 关键：
-// 1. 存在下跌中枢(上-下-上结构, direction = -1)
-// 2. 中枢完成后，向下跌破ZD，形成离开笔
-// 3. 随后反弹形成上涨笔
-// 4. 反弹高点 <= ZD (不升破中枢下沿，即不重新进入中枢)
-// 5. 反弹笔结束点 → 第三类卖点
+//
+// 实现要点（标准版本，不递归次级别）：
+// 1. 存在一个已完成的下跌中枢(上-下-上结构, direction = -1)
+// 2. 离开笔：向下跌破中枢ZD
+// 3. 反弹笔：当前向上笔反弹
+// 4. 不破ZD：反弹笔高点 <= ZD（不重新进入中枢区间）
+// 5. 信号点：反弹笔结束点
+//
+// 意义：
+// - 盘整背景：确认向下突破有效，走势完成
+// - 趋势背景：趋势完成后的反转确认点
+//
+// 结构：
+//   中枢A → 离开笔(↓) → 反弹笔(↑) → 3卖
+//              ↓跌破ZD      ↑不破ZD
 check_sell3(pen_idx) =>
     bool triggered = false
     if array.size(pen_centers) > 0 and pen_idx < array.size(pens)
@@ -961,6 +1041,176 @@ check_sell3(pen_idx) =>
                                         triggered := true
                         center_idx2 := center_idx2 - 1
     triggered
+
+// ============================================================
+// === 走势类型识别（标准版本，不递归次级别）===
+// ============================================================
+
+// === 判断走势是否完成 ===
+// 参数：trend - 走势对象
+// 返回：[is_completed, completion_type]
+check_trend_completion(Trend trend) =>
+    bool is_completed = false
+    string comp_type = "进行中"
+
+    int pen_count = array.size(pens)
+
+    if trend.type == 0
+        // 盘整走势完成判断
+        // 条件1：b段离开中枢后形成新的中枢（不与A重叠）
+        // 条件2：b段足够长（超过5笔）且未返回中枢
+
+        if not na(trend.first_center_idx) and trend.b_end_pen < pen_count
+            first_center = array.get(pen_centers, trend.first_center_idx)
+
+            // 检查b段后是否有新中枢
+            bool has_new_center = false
+            if trend.first_center_idx + 1 < array.size(pen_centers)
+                next_center = array.get(pen_centers, trend.first_center_idx + 1)
+                // 新中枢不与当前中枢重叠
+                if next_center.start_pen_idx > first_center.end_pen_idx
+                    if next_center.low > first_center.high or next_center.high < first_center.low
+                        has_new_center := true
+                        is_completed := true
+                        comp_type := "突破确认"
+
+            // 或者b段足够长且未返回
+            if not is_completed and trend.b_end_pen >= trend.b_start_pen + 5
+                // 检查最后一笔是否远离中枢
+                if trend.b_end_pen < pen_count
+                    last_b_pen = array.get(pens, trend.b_end_pen)
+                    if first_center.direction == 1  // 上涨中枢
+                        if last_b_pen.low > first_center.high * 1.02  // 远离中枢上沿2%
+                            is_completed := true
+                            comp_type := "突破确认"
+                    else if first_center.direction == -1  // 下跌中枢
+                        if last_b_pen.high < first_center.low * 0.98  // 远离中枢下沿2%
+                            is_completed := true
+                            comp_type := "突破确认"
+
+    else if trend.type == 1 or trend.type == -1
+        // 趋势走势完成判断
+        // 条件：b段后的c段出现背驰
+
+        if not na(trend.second_center_idx) and trend.second_center_idx < array.size(pen_centers)
+            second_center = array.get(pen_centers, trend.second_center_idx)
+
+            // 检查离开第二个中枢的笔是否背驰
+            int exit_pen_idx = second_center.end_pen_idx + 1
+            if exit_pen_idx < pen_count
+                exit_pen = array.get(pens, exit_pen_idx)
+
+                // 查找参照笔（b段：连接两个中枢的笔）
+                [ref_pen, ref_idx] = find_reference_pen(exit_pen, exit_pen_idx, second_center, trend.second_center_idx)
+
+                if not na(ref_pen) and not na(ref_idx)
+                    // 简单背驰判断
+                    bool has_divergence = false
+                    if trend.type == 1  // 上涨趋势
+                        if exit_pen.high > ref_pen.high  // 创新高
+                            if exit_pen.macd_area < ref_pen.macd_area * 0.8  // MACD背驰
+                                has_divergence := true
+                    else if trend.type == -1  // 下跌趋势
+                        if exit_pen.low < ref_pen.low  // 创新低
+                            if exit_pen.macd_area < ref_pen.macd_area * 0.8  // MACD背驰
+                                has_divergence := true
+
+                    if has_divergence
+                        is_completed := true
+                        comp_type := "背驰"
+
+    [is_completed, comp_type]
+
+// === 识别走势类型 ===
+// 从笔和中枢构建走势类型数组
+// 返回：识别到的走势数量
+identify_trends() =>
+    array.clear(trends)
+
+    int center_count = array.size(pen_centers)
+    int pen_count = array.size(pens)
+
+    if center_count == 0 or pen_count < 3
+        0  // 返回0表示没有走势
+    else
+        int next_trend_id = 0
+        int processed_center_idx = 0
+
+        // 从第一个中枢开始，逐个构建走势
+        while processed_center_idx < center_count
+            current_center = array.get(pen_centers, processed_center_idx)
+
+            // 创建新走势
+            var Trend new_trend = Trend.new()
+            new_trend.trend_id := next_trend_id
+            new_trend.center_ids := array.new<int>()
+            array.push(new_trend.center_ids, processed_center_idx)
+            new_trend.first_center_idx := processed_center_idx
+            new_trend.second_center_idx := na
+
+            // 识别a段（进入中枢前）
+            new_trend.a_start_pen := 0  // 简化：从起点或上一个走势结束点开始
+            if array.size(trends) > 0
+                last_trend = array.last(trends)
+                new_trend.a_start_pen := last_trend.end_pen_idx + 1
+
+            new_trend.a_end_pen := current_center.start_pen_idx - 1
+            if new_trend.a_end_pen < new_trend.a_start_pen
+                new_trend.a_end_pen := current_center.start_pen_idx
+
+            // 识别b段（离开中枢后）
+            new_trend.b_start_pen := current_center.end_pen_idx + 1
+            new_trend.start_pen_idx := new_trend.a_start_pen
+
+            // 检查b段是否形成新中枢（判断是趋势还是盘整）
+            bool found_second_center = false
+            if processed_center_idx + 1 < center_count
+                next_center = array.get(pen_centers, processed_center_idx + 1)
+
+                // 检查两个中枢是否不重叠（趋势的条件）
+                bool no_overlap = false
+                if next_center.low > current_center.high or next_center.high < current_center.low
+                    no_overlap := true
+                    found_second_center := true
+                    array.push(new_trend.center_ids, processed_center_idx + 1)
+                    new_trend.second_center_idx := processed_center_idx + 1
+                    new_trend.b_end_pen := next_center.start_pen_idx - 1
+
+                    // 判断趋势方向
+                    if next_center.low > current_center.high
+                        new_trend.type := 1  // 上涨趋势
+                    else if next_center.high < current_center.low
+                        new_trend.type := -1  // 下跌趋势
+                    else
+                        new_trend.type := 0  // 盘整（不应该走到这里）
+
+            if not found_second_center
+                // 盘整走势：只有一个中枢
+                new_trend.type := 0
+                // b段延伸到最后一笔或遇到新中枢
+                new_trend.b_end_pen := pen_count - 1
+                if processed_center_idx + 1 < center_count
+                    next_center = array.get(pen_centers, processed_center_idx + 1)
+                    new_trend.b_end_pen := next_center.start_pen_idx - 1
+
+            new_trend.end_pen_idx := new_trend.b_end_pen
+
+            // 判断走势是否完成
+            [is_completed, comp_type] = check_trend_completion(new_trend)
+            new_trend.completed := is_completed
+            new_trend.completion_type := comp_type
+
+            // 添加到走势数组
+            array.push(trends, new_trend)
+            next_trend_id := next_trend_id + 1
+
+            // 移动到下一个中枢
+            if found_second_center
+                processed_center_idx := processed_center_idx + 2  // 跳过第二个中枢
+            else
+                processed_center_idx := processed_center_idx + 1
+
+        array.size(trends)
 
 // === 基于笔的中枢构建 ===
 build_pen_centers() =>
@@ -1577,6 +1827,9 @@ if barstate.islast
     // 重新构建所有中枢（确保在最后一根K线时中枢被正确构建）
     check_and_build_centers()
 
+    // 识别走势类型
+    identify_trends()
+
     // 清理旧的交易信号
     if array.size(trade_signals) > 0
         for i = 0 to array.size(trade_signals) - 1
@@ -1830,7 +2083,7 @@ if barstate.islast
 plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
 
 // === 信息表格 (白色主题) ===
-var table info_table = table.new(position.top_right, 2, 15, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
+var table info_table = table.new(position.top_right, 2, 16, bgcolor = #ffffff, border_width = 1, border_color = #e0e0e0)
 if barstate.islast
     // 白色主题颜色配置
     color title_bg = #f5f5f5      // 浅灰背景
@@ -1853,35 +2106,57 @@ if barstate.islast
     table.cell(info_table, 0, 1, "次级别", text_color = title_text, bgcolor = title_bg, text_size = size.small)
     table.cell(info_table, 1, 1, sub_level, text_color = value_text, bgcolor = value_bg, text_size = size.small)
     table.cell(info_table, 0, 2, "走势类型", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    color trend_color = trend_type == "上涨" or trend_type == "上涨趋势" ? on_text :
-                       trend_type == "下跌" or trend_type == "下跌趋势" ? warning_text : value_text
-    table.cell(info_table, 1, 2, trend_type, text_color = trend_color, bgcolor = value_bg, text_size = size.small)
+
+    // 获取当前走势信息（使用新的走势识别结果）
+    string trend_display = trend_type
+    string completion_display = ""
+    if array.size(trends) > 0
+        last_trend = array.last(trends)
+        // 走势类型
+        if last_trend.type == 1
+            trend_display := "上涨趋势"
+        else if last_trend.type == -1
+            trend_display := "下跌趋势"
+        else
+            trend_display := "盘整"
+
+        // 走势完成状态
+        completion_display := last_trend.completed ? "✓ " + last_trend.completion_type : "进行中"
+
+    color trend_color = trend_display == "上涨趋势" ? on_text :
+                       trend_display == "下跌趋势" ? warning_text : value_text
+    table.cell(info_table, 1, 2, trend_display, text_color = trend_color, bgcolor = value_bg, text_size = size.small)
+
+    // 新增：走势完成状态行
+    table.cell(info_table, 0, 3, "走势状态", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    color completion_color = completion_display == "进行中" ? value_text : highlight_text
+    table.cell(info_table, 1, 3, completion_display, text_color = completion_color, bgcolor = value_bg, text_size = size.small)
 
     // 基础统计
-    table.cell(info_table, 0, 3, "合并K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 3, str.tostring(array.size(kx_array)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 4, "分型数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 4, str.tostring(array.size(pen_fractals)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 5, "笔数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 5, str.tostring(array.size(pens)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 6, "中枢数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 6, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 7, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 7, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 4, "合并K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 4, str.tostring(array.size(kx_array)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 5, "分型数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 5, str.tostring(array.size(pen_fractals)), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 6, "笔数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 6, str.tostring(array.size(pens)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 7, "中枢数", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 7, str.tostring(array.size(pen_centers)), text_color = highlight_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 8, "买卖点", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 8, str.tostring(array.size(trade_signals)), text_color = #f57c00, bgcolor = value_bg, text_size = size.small)
 
     // 算法设置
-    table.cell(info_table, 0, 8, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 8, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 9, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 9, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 10, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 10, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 9, "笔算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 9, pen_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 10, "中枢算法", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 10, zs_algo, text_color = #7b1fa2, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 11, "最小K线", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 11, str.tostring(min_pen_bars), text_color = value_text, bgcolor = value_bg, text_size = size.small)
 
     // 功能开关
-    table.cell(info_table, 0, 11, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 11, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
-    table.cell(info_table, 0, 12, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_table, 1, 12, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 12, "缺口算K", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 12, gap_as_kl ? "✓" : "✗", text_color = gap_as_kl ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
+    table.cell(info_table, 0, 13, "端点极值", text_color = title_text, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_table, 1, 13, bi_end_is_peak ? "✓" : "✗", text_color = bi_end_is_peak ? on_text : off_text, bgcolor = value_bg, text_size = size.small)
 
 
 
