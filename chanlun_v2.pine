@@ -1,0 +1,1441 @@
+//@version=6
+indicator('缠论完整系统 V2 (Chanlun Pro)', '缠论V2', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+
+// ============================================================================
+// 缠论系统 V2 - 完整实现
+// ============================================================================
+// 计算流程：原始K线 → K线合并 → 分型识别 → 笔 → 线段 → 中枢 → 买卖点
+//
+// 核心改进：
+// 1. 增量计算：笔在形成时即时计算，避免重复计算
+// 2. 严格的特征序列：线段基于特征序列分型
+// 3. 完整的买卖点：包含1/1p/2/2s/3a/3b
+// 4. 优化的中枢合并：正确的zs/peak模式
+// ============================================================================
+
+// ==================== 用户参数 ====================
+group_bi = "笔参数"
+bi_strict = input.bool(true, title = '严格笔模式', group = group_bi, tooltip = '笔至少需要4根合并K线（含首尾）')
+bi_fx_check = input.string('strict', title = '分型校验', group = group_bi, options = ['strict', 'normal'], tooltip = 'strict=顶底分型区间不重叠')
+bi_end_is_peak = input.bool(true, title = '笔端点极值', group = group_bi, tooltip = '笔的结束分型必须是区间内的极值点')
+
+group_seg = "线段参数"
+seg_algo = input.string('1+1', title = '线段算法', group = group_seg, options = ['1+1', 'simple'], tooltip = '1+1=标准特征序列破坏, simple=简化算法')
+
+group_zs = "中枢参数"
+zs_algo = input.string('normal', title = '中枢算法', group = group_zs, options = ['normal', 'simple'], tooltip = 'normal=基于特征序列, simple=基于连续笔')
+zs_need_combine = input.bool(true, title = '中枢合并', group = group_zs, tooltip = '相邻中枢有重叠时合并')
+zs_combine_mode = input.string('zs', title = '合并模式', group = group_zs, options = ['zs', 'peak'], tooltip = 'zs=按中枢区间[ZD,ZG]合并, peak=按极值[DD,GG]合并')
+
+group_bsp = "买卖点参数"
+bsp_enabled = input.bool(true, title = '启用买卖点', group = group_bsp)
+bsp_types = input.string('1,1p,2,2s,3a,3b', title = '买卖点类型', group = group_bsp, tooltip = '1=一类, 1p=盘整一类, 2=二类, 2s=类二, 3a=三类A, 3b=三类B')
+bsp1_only_multibi_zs = input.bool(true, title = '一类仅多笔中枢', group = group_bsp, tooltip = '一类买卖点只考虑包含3笔以上的中枢')
+bsp2_follow_1 = input.bool(true, title = '二类跟随一类', group = group_bsp)
+bsp3_follow_1 = input.bool(true, title = '三类跟随一类', group = group_bsp)
+max_bs2_rate = input.float(0.9999, title = '二类最大回撤', group = group_bsp, minval = 0.1, maxval = 1.5, step = 0.01)
+divergence_rate = input.float(999.0, title = '背驰阈值', group = group_bsp, minval = 0.1, maxval = 999.0, step = 0.1, tooltip = '999表示不限制背驰比例')
+
+group_macd = "MACD参数"
+macd_algo = input.string('peak', title = 'MACD算法', group = group_macd, options = ['peak', 'area'], tooltip = 'peak=峰值法, area=面积法')
+macd_fast = input.int(12, title = 'MACD快线', group = group_macd, minval = 1)
+macd_slow = input.int(26, title = 'MACD慢线', group = group_macd, minval = 1)
+macd_signal = input.int(9, title = 'MACD信号线', group = group_macd, minval = 1)
+
+group_display = "显示参数"
+show_merged_kl = input.bool(false, title = '显示合并K线', group = group_display)
+show_fx = input.bool(false, title = '显示分型', group = group_display)
+show_bi = input.bool(true, title = '显示笔', group = group_display)
+show_seg = input.bool(true, title = '显示线段', group = group_display)
+show_zs = input.bool(true, title = '显示中枢', group = group_display)
+show_bsp = input.bool(true, title = '显示买卖点', group = group_display)
+show_info = input.bool(true, title = '显示信息面板', group = group_display)
+
+group_color = "颜色参数"
+color_bi_up = input.color(color.new(#ff5252, 0), title = '向上笔', group = group_color)
+color_bi_down = input.color(color.new(#4caf50, 0), title = '向下笔', group = group_color)
+color_seg_up = input.color(color.new(#ff9800, 0), title = '向上线段', group = group_color)
+color_seg_down = input.color(color.new(#00bcd4, 0), title = '向下线段', group = group_color)
+color_zs_bg = input.color(color.new(#2196f3, 85), title = '中枢背景', group = group_color)
+color_zs_border = input.color(color.new(#2196f3, 30), title = '中枢边框', group = group_color)
+color_buy = input.color(color.new(#e91e63, 0), title = '买点', group = group_color)
+color_sell = input.color(color.new(#9c27b0, 0), title = '卖点', group = group_color)
+
+// ==================== MACD计算 ====================
+[macd_line, signal_line, macd_hist] = ta.macd(close, macd_fast, macd_slow, macd_signal)
+
+// ==================== 数据结构定义 ====================
+
+// 合并后的K线
+type MergedKLine
+    int idx             // 索引
+    float hi            // 高点
+    float lo            // 低点
+    int bar_start       // 起始bar_index
+    int bar_end         // 结束bar_index
+    int time_start      // 起始时间
+    int time_end        // 结束时间
+    int direction       // 方向: 1=向上, -1=向下, 0=未定
+
+// 分型
+type Fractal
+    int idx             // 索引
+    int fx_type         // 类型: 1=顶分型, -1=底分型
+    float fx_val        // 分型值（顶分型取高点，底分型取低点）
+    float fx_high       // 分型区间最高点（三根K线）
+    float fx_low        // 分型区间最低点（三根K线）
+    int kl_idx          // 中间K线索引
+    int bar_idx         // bar索引
+    int bar_time        // 时间
+
+// 笔
+type Stroke
+    int idx             // 索引
+    int direction       // 方向: 1=向上, -1=向下
+    int start_fx_idx    // 起始分型索引
+    int end_fx_idx      // 结束分型索引
+    float hi            // 笔最高点
+    float lo            // 笔最低点
+    int bar_start       // 起始bar
+    int bar_end         // 结束bar
+    int time_start      // 起始时间
+    int time_end        // 结束时间
+    bool is_confirmed   // 是否已确认
+    int seg_idx         // 所属线段索引
+    float macd_val      // MACD指标值
+    line ln             // 画线对象
+
+// 线段
+type Segment
+    int idx             // 索引
+    int direction       // 方向
+    int start_bi_idx    // 起始笔索引
+    int end_bi_idx      // 结束笔索引
+    float hi            // 线段最高点
+    float lo            // 线段最低点
+    int time_start      // 起始时间
+    int time_end        // 结束时间
+    bool is_confirmed   // 是否已确认
+    line ln             // 画线对象
+
+// 中枢
+type Pivot
+    int idx             // 索引
+    float zg            // 中枢上沿 = min(各笔高点)
+    float zd            // 中枢下沿 = max(各笔低点)
+    float gg            // 中枢最高点
+    float dd            // 中枢最低点
+    int begin_bi_idx    // 中枢起始笔索引
+    int end_bi_idx      // 中枢结束笔索引
+    int bi_in_idx       // 进入中枢的笔索引
+    int bi_out_idx      // 离开中枢的笔索引
+    int seg_idx         // 所属线段索引
+    int time_start      // 起始时间
+    int time_end        // 结束时间
+    bool is_confirmed   // 是否已确认
+    box bx              // 画框对象
+
+// 买卖点
+type BSPoint
+    int bsp_type        // 类型: ±1=一类, ±11=盘整一类, ±2=二类, ±21=类二, ±3=三类
+    int bi_idx          // 对应笔索引
+    int zs_idx          // 对应中枢索引
+    float price         // 买卖点价格
+    int bar_idx         // bar索引
+    int bar_time        // 时间
+    int relate_bsp1_idx // 关联的一类买卖点索引
+    float feature_val   // 特征值（背驰率/回撤率等）
+    label lbl           // 标签对象
+
+// ==================== 全局变量 ====================
+var array<MergedKLine> g_klines = array.new<MergedKLine>()
+var array<Fractal> g_fractals = array.new<Fractal>()
+var array<Stroke> g_strokes = array.new<Stroke>()
+var array<Segment> g_segments = array.new<Segment>()
+var array<Pivot> g_pivots = array.new<Pivot>()
+var array<BSPoint> g_bspoints = array.new<BSPoint>()
+var array<float> g_macd_hist = array.new<float>()
+
+// 当前正在形成的K线状态
+var float curr_kl_hi = na
+var float curr_kl_lo = na
+var int curr_kl_bar_start = na
+var int curr_kl_time_start = na
+var bool kl_init = false
+
+// ==================== 辅助函数 ====================
+
+// 安全删除图形对象
+safe_del_line(ln) =>
+    if not na(ln)
+        line.delete(ln)
+
+safe_del_box(bx) =>
+    if not na(bx)
+        box.delete(bx)
+
+safe_del_label(lbl) =>
+    if not na(lbl)
+        label.delete(lbl)
+
+// 检查两个区间是否有重叠
+has_overlap(float lo1, float hi1, float lo2, float hi2) =>
+    not (hi1 < lo2 or hi2 < lo1)
+
+// 检查包含关系
+is_contain(float h1, float l1, float h2, float l2) =>
+    (h1 >= h2 and l1 <= l2) or (h2 >= h1 and l2 <= l1)
+
+// 检查买卖点类型是否启用
+is_bsp_enabled(string t) =>
+    str.contains(bsp_types, t)
+
+// 计算笔的振幅
+stroke_amp(Stroke s) =>
+    math.abs(s.hi - s.lo)
+
+// 获取笔的起始值
+stroke_begin_val(Stroke s) =>
+    s.direction == 1 ? s.lo : s.hi
+
+// 获取笔的结束值
+stroke_end_val(Stroke s) =>
+    s.direction == 1 ? s.hi : s.lo
+
+// 计算MACD指标（峰值法）
+calc_macd_peak(int start_bar, int end_bar, int dir) =>
+    float peak = 0.0
+    int arr_len = array.size(g_macd_hist)
+    if arr_len > 0 and start_bar <= end_bar
+        int offset = bar_index - arr_len + 1
+        int i_start = math.max(0, start_bar - offset)
+        int i_end = math.min(arr_len - 1, end_bar - offset)
+        if i_start >= 0 and i_end >= i_start and i_end < arr_len
+            for i = i_start to i_end
+                float v = array.get(g_macd_hist, i)
+                if dir == 1
+                    if v > peak
+                        peak := v
+                else
+                    if v < 0 and math.abs(v) > peak
+                        peak := math.abs(v)
+    peak
+
+// 计算MACD指标（面积法）
+calc_macd_area(int start_bar, int end_bar, int dir) =>
+    float area = 0.0
+    int arr_len = array.size(g_macd_hist)
+    if arr_len > 0 and start_bar <= end_bar
+        int offset = bar_index - arr_len + 1
+        int i_start = math.max(0, start_bar - offset)
+        int i_end = math.min(arr_len - 1, end_bar - offset)
+        if i_start >= 0 and i_end >= i_start and i_end < arr_len
+            for i = i_start to i_end
+                float v = array.get(g_macd_hist, i)
+                if dir == 1 and v > 0
+                    area += v
+                else if dir == -1 and v < 0
+                    area += math.abs(v)
+    area
+
+// 计算笔的MACD值
+calc_stroke_macd(Stroke s) =>
+    if macd_algo == 'peak'
+        calc_macd_peak(s.bar_start, s.bar_end, s.direction)
+    else
+        calc_macd_area(s.bar_start, s.bar_end, s.direction)
+
+// ==================== 存储MACD历史 ====================
+array.push(g_macd_hist, macd_hist)
+if array.size(g_macd_hist) > 3000
+    array.shift(g_macd_hist)
+
+// ==================== K线合并处理 ====================
+
+// 判断K线合并方向
+get_merge_direction() =>
+    int dir = 0
+    if array.size(g_klines) > 0
+        last_kl = array.last(g_klines)
+        dir := last_kl.direction
+        // 如果前一根方向未定，根据高低点判断
+        if dir == 0
+            if curr_kl_hi > last_kl.hi
+                dir := 1
+            else if curr_kl_lo < last_kl.lo
+                dir := -1
+    else
+        // 第一根K线根据开收判断
+        dir := close >= open ? 1 : -1
+    dir
+
+// 处理K线合并
+process_kline_merge() =>
+    if not kl_init
+        curr_kl_hi := high
+        curr_kl_lo := low
+        curr_kl_bar_start := bar_index
+        curr_kl_time_start := time
+        kl_init := true
+    else
+        bool has_contain = is_contain(curr_kl_hi, curr_kl_lo, high, low)
+
+        if has_contain
+            // 存在包含关系，进行合并
+            int merge_dir = get_merge_direction()
+            if merge_dir >= 0  // 向上或未定
+                curr_kl_hi := math.max(curr_kl_hi, high)
+                curr_kl_lo := math.max(curr_kl_lo, low)
+            else  // 向下
+                curr_kl_hi := math.min(curr_kl_hi, high)
+                curr_kl_lo := math.min(curr_kl_lo, low)
+        else
+            // 无包含关系，保存当前合并K线，开始新的
+            int kl_dir = 0
+            if array.size(g_klines) > 0
+                prev_kl = array.last(g_klines)
+                kl_dir := curr_kl_hi > prev_kl.hi ? 1 : -1
+
+            new_kl = MergedKLine.new(
+                 array.size(g_klines),
+                 curr_kl_hi,
+                 curr_kl_lo,
+                 curr_kl_bar_start,
+                 bar_index - 1,
+                 curr_kl_time_start,
+                 time[1],
+                 kl_dir)
+            array.push(g_klines, new_kl)
+
+            // 开始新的合并K线
+            curr_kl_hi := high
+            curr_kl_lo := low
+            curr_kl_bar_start := bar_index
+            curr_kl_time_start := time
+
+// 执行K线合并
+process_kline_merge()
+
+// 限制数组大小
+if array.size(g_klines) > 2000
+    array.shift(g_klines)
+
+// ==================== 分型识别 ====================
+
+// 检测分型
+detect_fractal() =>
+    Fractal result = na
+    int kl_cnt = array.size(g_klines)
+
+    if kl_cnt >= 3
+        k1 = array.get(g_klines, kl_cnt - 3)
+        k2 = array.get(g_klines, kl_cnt - 2)
+        k3 = array.get(g_klines, kl_cnt - 1)
+
+        // 顶分型：中间K线的高点和低点都高于两边
+        bool is_top = k2.hi > k1.hi and k2.hi > k3.hi and k2.lo > k1.lo and k2.lo > k3.lo
+        // 底分型：中间K线的高点和低点都低于两边
+        bool is_bot = k2.lo < k1.lo and k2.lo < k3.lo and k2.hi < k1.hi and k2.hi < k3.hi
+
+        if is_top or is_bot
+            int fx_t = is_top ? 1 : -1
+            float fx_v = is_top ? k2.hi : k2.lo
+            float fx_hi = math.max(k1.hi, math.max(k2.hi, k3.hi))
+            float fx_lo = math.min(k1.lo, math.min(k2.lo, k3.lo))
+
+            // 检查是否是新分型（避免重复）
+            bool is_new = true
+            if array.size(g_fractals) > 0
+                last_fx = array.last(g_fractals)
+                if last_fx.kl_idx == k2.idx
+                    is_new := false
+
+            if is_new
+                result := Fractal.new(
+                     array.size(g_fractals),
+                     fx_t,
+                     fx_v,
+                     fx_hi,
+                     fx_lo,
+                     k2.idx,
+                     k2.bar_end,
+                     k2.time_end)
+    result
+
+// 检查笔的K线跨度
+check_stroke_span(int start_kl_idx, int end_kl_idx) =>
+    int span = end_kl_idx - start_kl_idx
+    // 严格模式：至少4根K线（即跨度>=3）
+    // 非严格模式：至少3根K线（即跨度>=2）
+    bi_strict ? span >= 3 : span >= 2
+
+// 检查分型有效性（顶底分型不重叠）
+check_fx_valid(Fractal fx_start, Fractal fx_end) =>
+    if bi_fx_check == 'strict'
+        if fx_start.fx_type == 1 and fx_end.fx_type == -1
+            // 顶分型 -> 底分型：底分型的中间值 < 顶分型的区间最低点
+            fx_end.fx_val < fx_start.fx_low
+        else if fx_start.fx_type == -1 and fx_end.fx_type == 1
+            // 底分型 -> 顶分型：顶分型的中间值 > 底分型的区间最高点
+            fx_end.fx_val > fx_start.fx_high
+        else
+            false
+    else
+        true
+
+// 检查笔端点是否是区间极值
+check_stroke_peak(int start_kl_idx, int end_kl_idx, bool is_up) =>
+    if not bi_end_is_peak
+        true
+    else
+        bool is_peak = true
+        if end_kl_idx > start_kl_idx and end_kl_idx < array.size(g_klines)
+            end_kl = array.get(g_klines, end_kl_idx)
+            float cmp_val = is_up ? end_kl.hi : end_kl.lo
+            for i = start_kl_idx + 1 to end_kl_idx - 1
+                if i < array.size(g_klines)
+                    kl = array.get(g_klines, i)
+                    if is_up and kl.hi > cmp_val
+                        is_peak := false
+                        break
+                    if not is_up and kl.lo < cmp_val
+                        is_peak := false
+                        break
+        is_peak
+
+// 创建新笔
+create_stroke(Fractal fx_start, Fractal fx_end) =>
+    int bi_dir = fx_end.fx_type  // 向上笔结束于顶分型，向下笔结束于底分型
+    float bi_hi = math.max(fx_start.fx_val, fx_end.fx_val)
+    float bi_lo = math.min(fx_start.fx_val, fx_end.fx_val)
+
+    // 创建画线
+    line ln = na
+    if show_bi
+        float y1 = bi_dir == 1 ? bi_lo : bi_hi
+        float y2 = bi_dir == 1 ? bi_hi : bi_lo
+        ln := line.new(fx_start.bar_time, y1, fx_end.bar_time, y2,
+             xloc = xloc.bar_time,
+             color = bi_dir == 1 ? color_bi_up : color_bi_down,
+             width = 2,
+             style = line.style_dashed)
+
+    new_stroke = Stroke.new(
+         array.size(g_strokes),
+         bi_dir,
+         fx_start.idx,
+         fx_end.idx,
+         bi_hi,
+         bi_lo,
+         fx_start.bar_idx,
+         fx_end.bar_idx,
+         fx_start.bar_time,
+         fx_end.bar_time,
+         false,
+         -1,
+         0.0,
+         ln)
+
+    new_stroke.macd_val := calc_stroke_macd(new_stroke)
+    new_stroke
+
+// 处理笔的形成
+process_stroke(Fractal new_fx) =>
+    if array.size(g_fractals) == 0
+        array.push(g_fractals, new_fx)
+    else
+        last_fx = array.last(g_fractals)
+
+        if new_fx.fx_type != last_fx.fx_type
+            // 不同类型的分型，尝试形成新笔
+            bool span_ok = check_stroke_span(last_fx.kl_idx, new_fx.kl_idx)
+            bool fx_ok = check_fx_valid(last_fx, new_fx)
+            bool is_up = new_fx.fx_type == 1
+            bool peak_ok = check_stroke_peak(last_fx.kl_idx, new_fx.kl_idx, is_up)
+
+            if span_ok and fx_ok and peak_ok
+                array.push(g_fractals, new_fx)
+
+                // 确认前一笔
+                if array.size(g_strokes) > 0
+                    prev_stroke = array.last(g_strokes)
+                    prev_stroke.is_confirmed := true
+                    if not na(prev_stroke.ln)
+                        line.set_style(prev_stroke.ln, line.style_solid)
+
+                // 创建新笔
+                new_stroke = create_stroke(last_fx, new_fx)
+                array.push(g_strokes, new_stroke)
+        else
+            // 同类型分型，检查是否需要延伸
+            bool should_extend = false
+            if new_fx.fx_type == 1
+                should_extend := new_fx.fx_val > last_fx.fx_val
+            else
+                should_extend := new_fx.fx_val < last_fx.fx_val
+
+            if should_extend
+                // 移除旧分型
+                array.pop(g_fractals)
+
+                // 移除并重建最后一笔
+                if array.size(g_strokes) > 0
+                    old_stroke = array.pop(g_strokes)
+                    safe_del_line(old_stroke.ln)
+
+                    // 恢复前一笔状态
+                    if array.size(g_strokes) > 0
+                        prev_stroke = array.last(g_strokes)
+                        prev_stroke.is_confirmed := false
+                        if not na(prev_stroke.ln)
+                            line.set_style(prev_stroke.ln, line.style_dashed)
+
+                // 添加新分型
+                array.push(g_fractals, new_fx)
+
+                // 重建笔
+                if array.size(g_fractals) >= 2
+                    prev_fx = array.get(g_fractals, array.size(g_fractals) - 2)
+                    new_stroke = create_stroke(prev_fx, new_fx)
+                    array.push(g_strokes, new_stroke)
+
+// 执行分型检测和笔处理
+new_fx = detect_fractal()
+if not na(new_fx)
+    process_stroke(new_fx)
+
+    // 显示分型标签
+    if show_fx
+        label.new(new_fx.bar_time, new_fx.fx_val,
+             new_fx.fx_type == 1 ? "顶" : "底",
+             xloc = xloc.bar_time,
+             color = new_fx.fx_type == 1 ? color.red : color.green,
+             textcolor = color.white,
+             size = size.tiny,
+             style = new_fx.fx_type == 1 ? label.style_label_down : label.style_label_up)
+
+// ==================== 最后一根K线处理 ====================
+if barstate.islast
+    // 确认最后一笔
+    if array.size(g_strokes) > 0
+        last_stroke = array.last(g_strokes)
+        if not last_stroke.is_confirmed
+            last_stroke.is_confirmed := true
+            if not na(last_stroke.ln)
+                line.set_style(last_stroke.ln, line.style_solid)
+
+    // ==================== 清理旧线段 ====================
+    if array.size(g_segments) > 0
+        for i = 0 to array.size(g_segments) - 1
+            seg = array.get(g_segments, i)
+            safe_del_line(seg.ln)
+        array.clear(g_segments)
+
+    // ==================== 构建线段 ====================
+    int stroke_cnt = array.size(g_strokes)
+    int max_strokes = 200
+    int stroke_start = math.max(0, stroke_cnt - max_strokes)
+
+    if stroke_cnt >= 3
+        if seg_algo == 'simple'
+            // 简化线段算法：价格突破判断
+            int seg_begin = stroke_start
+            int curr_dir = array.get(g_strokes, stroke_start).direction
+            float seg_hi = array.get(g_strokes, stroke_start).hi
+            float seg_lo = array.get(g_strokes, stroke_start).lo
+
+            int i = stroke_start + 1
+            while i < stroke_cnt
+                stroke = array.get(g_strokes, i)
+                seg_hi := math.max(seg_hi, stroke.hi)
+                seg_lo := math.min(seg_lo, stroke.lo)
+
+                // 检查是否结束线段
+                bool should_end = false
+                if i >= seg_begin + 2
+                    start_stroke = array.get(g_strokes, seg_begin)
+                    if curr_dir == 1 and stroke.lo < start_stroke.lo
+                        should_end := true
+                    else if curr_dir == -1 and stroke.hi > start_stroke.hi
+                        should_end := true
+
+                if should_end and i > seg_begin + 1
+                    start_stroke = array.get(g_strokes, seg_begin)
+                    end_stroke = array.get(g_strokes, i - 1)
+
+                    // 创建线段
+                    line ln = na
+                    if show_seg
+                        float y1 = curr_dir == 1 ? start_stroke.lo : start_stroke.hi
+                        float y2 = curr_dir == 1 ? end_stroke.hi : end_stroke.lo
+                        ln := line.new(start_stroke.time_start, y1, end_stroke.time_end, y2,
+                             xloc = xloc.bar_time,
+                             color = curr_dir == 1 ? color_seg_up : color_seg_down,
+                             width = 3)
+
+                    new_seg = Segment.new(
+                         array.size(g_segments),
+                         curr_dir,
+                         seg_begin,
+                         i - 1,
+                         seg_hi,
+                         seg_lo,
+                         start_stroke.time_start,
+                         end_stroke.time_end,
+                         true,
+                         ln)
+
+                    // 更新笔的线段归属
+                    for j = seg_begin to i - 1
+                        s = array.get(g_strokes, j)
+                        s.seg_idx := new_seg.idx
+
+                    array.push(g_segments, new_seg)
+                    seg_begin := i - 1
+                    curr_dir := -curr_dir
+                    seg_hi := stroke.hi
+                    seg_lo := stroke.lo
+
+                i := i + 1
+
+            // 最后一个未完成线段
+            if seg_begin < stroke_cnt - 1
+                start_stroke = array.get(g_strokes, seg_begin)
+                end_stroke = array.get(g_strokes, stroke_cnt - 1)
+
+                float final_hi = start_stroke.hi
+                float final_lo = start_stroke.lo
+                for j = seg_begin to stroke_cnt - 1
+                    s = array.get(g_strokes, j)
+                    final_hi := math.max(final_hi, s.hi)
+                    final_lo := math.min(final_lo, s.lo)
+
+                line ln = na
+                if show_seg
+                    float y1 = curr_dir == 1 ? start_stroke.lo : start_stroke.hi
+                    float y2 = curr_dir == 1 ? end_stroke.hi : end_stroke.lo
+                    ln := line.new(start_stroke.time_start, y1, end_stroke.time_end, y2,
+                         xloc = xloc.bar_time,
+                         color = curr_dir == 1 ? color_seg_up : color_seg_down,
+                         width = 3,
+                         style = line.style_dashed)
+
+                new_seg = Segment.new(
+                     array.size(g_segments),
+                     curr_dir,
+                     seg_begin,
+                     stroke_cnt - 1,
+                     final_hi,
+                     final_lo,
+                     start_stroke.time_start,
+                     end_stroke.time_end,
+                     false,
+                     ln)
+
+                for j = seg_begin to stroke_cnt - 1
+                    s = array.get(g_strokes, j)
+                    s.seg_idx := new_seg.idx
+
+                array.push(g_segments, new_seg)
+
+        else
+            // 标准线段算法 (1+1终结)：基于特征序列分型
+            int seg_begin = stroke_start
+            int curr_dir = array.get(g_strokes, stroke_start).direction
+
+            int i = stroke_start + 2
+            while i < stroke_cnt
+                // 提取特征序列（与线段方向相反的笔）
+                feat_his = array.new<float>()
+                feat_los = array.new<float>()
+                feat_idxs = array.new<int>()
+
+                for j = seg_begin to i
+                    if j < stroke_cnt
+                        s = array.get(g_strokes, j)
+                        if s.direction != curr_dir
+                            array.push(feat_his, s.hi)
+                            array.push(feat_los, s.lo)
+                            array.push(feat_idxs, j)
+
+                // 检查特征序列是否形成分型
+                bool has_fx = false
+                int fx_bi_idx = -1
+                int seq_len = array.size(feat_his)
+
+                if seq_len >= 3
+                    float h1 = array.get(feat_his, seq_len - 3)
+                    float h2 = array.get(feat_his, seq_len - 2)
+                    float h3 = array.get(feat_his, seq_len - 1)
+                    float l1 = array.get(feat_los, seq_len - 3)
+                    float l2 = array.get(feat_los, seq_len - 2)
+                    float l3 = array.get(feat_los, seq_len - 1)
+
+                    if curr_dir == 1
+                        // 向上线段，检查特征序列的底分型
+                        if l2 <= l1 and l2 <= l3 and h2 <= h1 and h2 <= h3
+                            has_fx := true
+                            fx_bi_idx := array.get(feat_idxs, seq_len - 2)
+                    else
+                        // 向下线段，检查特征序列的顶分型
+                        if h2 >= h1 and h2 >= h3 and l2 >= l1 and l2 >= l3
+                            has_fx := true
+                            fx_bi_idx := array.get(feat_idxs, seq_len - 2)
+
+                if has_fx and fx_bi_idx > seg_begin
+                    start_stroke = array.get(g_strokes, seg_begin)
+                    end_stroke = array.get(g_strokes, fx_bi_idx)
+
+                    float seg_hi = start_stroke.hi
+                    float seg_lo = start_stroke.lo
+                    for j = seg_begin to fx_bi_idx
+                        s = array.get(g_strokes, j)
+                        seg_hi := math.max(seg_hi, s.hi)
+                        seg_lo := math.min(seg_lo, s.lo)
+
+                    line ln = na
+                    if show_seg
+                        float y1 = curr_dir == 1 ? start_stroke.lo : start_stroke.hi
+                        float y2 = curr_dir == 1 ? end_stroke.hi : end_stroke.lo
+                        ln := line.new(start_stroke.time_start, y1, end_stroke.time_end, y2,
+                             xloc = xloc.bar_time,
+                             color = curr_dir == 1 ? color_seg_up : color_seg_down,
+                             width = 3)
+
+                    new_seg = Segment.new(
+                         array.size(g_segments),
+                         curr_dir,
+                         seg_begin,
+                         fx_bi_idx,
+                         seg_hi,
+                         seg_lo,
+                         start_stroke.time_start,
+                         end_stroke.time_end,
+                         true,
+                         ln)
+
+                    for j = seg_begin to fx_bi_idx
+                        s = array.get(g_strokes, j)
+                        s.seg_idx := new_seg.idx
+
+                    array.push(g_segments, new_seg)
+                    seg_begin := fx_bi_idx
+                    curr_dir := -curr_dir
+                    i := fx_bi_idx + 2
+                else
+                    i := i + 1
+
+            // 最后一个未完成线段
+            if seg_begin < stroke_cnt - 1
+                start_stroke = array.get(g_strokes, seg_begin)
+                end_stroke = array.get(g_strokes, stroke_cnt - 1)
+
+                float seg_hi = start_stroke.hi
+                float seg_lo = start_stroke.lo
+                for j = seg_begin to stroke_cnt - 1
+                    s = array.get(g_strokes, j)
+                    seg_hi := math.max(seg_hi, s.hi)
+                    seg_lo := math.min(seg_lo, s.lo)
+
+                line ln = na
+                if show_seg
+                    float y1 = curr_dir == 1 ? start_stroke.lo : start_stroke.hi
+                    float y2 = curr_dir == 1 ? end_stroke.hi : end_stroke.lo
+                    ln := line.new(start_stroke.time_start, y1, end_stroke.time_end, y2,
+                         xloc = xloc.bar_time,
+                         color = curr_dir == 1 ? color_seg_up : color_seg_down,
+                         width = 3,
+                         style = line.style_dashed)
+
+                new_seg = Segment.new(
+                     array.size(g_segments),
+                     curr_dir,
+                     seg_begin,
+                     stroke_cnt - 1,
+                     seg_hi,
+                     seg_lo,
+                     start_stroke.time_start,
+                     end_stroke.time_end,
+                     false,
+                     ln)
+
+                for j = seg_begin to stroke_cnt - 1
+                    s = array.get(g_strokes, j)
+                    s.seg_idx := new_seg.idx
+
+                array.push(g_segments, new_seg)
+
+    // ==================== 清理旧中枢 ====================
+    if array.size(g_pivots) > 0
+        for i = 0 to array.size(g_pivots) - 1
+            pv = array.get(g_pivots, i)
+            safe_del_box(pv.bx)
+        array.clear(g_pivots)
+
+    // ==================== 构建中枢 ====================
+    int seg_cnt = array.size(g_segments)
+
+    if zs_algo == 'normal' and seg_cnt > 0
+        // 基于线段的中枢计算
+        for seg_i = 0 to seg_cnt - 1
+            seg = array.get(g_segments, seg_i)
+
+            if seg.end_bi_idx - seg.start_bi_idx >= 2
+                // 提取特征序列
+                feat_bis = array.new<int>()
+                for bi_i = seg.start_bi_idx to seg.end_bi_idx
+                    if bi_i < stroke_cnt
+                        s = array.get(g_strokes, bi_i)
+                        if s.direction != seg.direction
+                            array.push(feat_bis, bi_i)
+
+                int feat_cnt = array.size(feat_bis)
+                if feat_cnt >= 2
+                    int start_idx = 0
+
+                    while start_idx <= feat_cnt - 2
+                        int bi_idx1 = array.get(feat_bis, start_idx)
+                        int bi_idx2 = array.get(feat_bis, start_idx + 1)
+
+                        s1 = array.get(g_strokes, bi_idx1)
+                        s2 = array.get(g_strokes, bi_idx2)
+
+                        // 计算中枢区间
+                        float zd = math.max(s1.lo, s2.lo)
+                        float zg = math.min(s1.hi, s2.hi)
+
+                        if zd < zg
+                            float gg = math.max(s1.hi, s2.hi)
+                            float dd = math.min(s1.lo, s2.lo)
+                            int end_feat_idx = start_idx + 1
+
+                            // 尝试延伸中枢
+                            if start_idx + 2 < feat_cnt
+                                for j = start_idx + 2 to feat_cnt - 1
+                                    int bi_idx_ext = array.get(feat_bis, j)
+                                    s_ext = array.get(g_strokes, bi_idx_ext)
+
+                                    if has_overlap(zd, zg, s_ext.lo, s_ext.hi)
+                                        float new_zd = math.max(zd, s_ext.lo)
+                                        float new_zg = math.min(zg, s_ext.hi)
+
+                                        if new_zd < new_zg
+                                            zd := new_zd
+                                            zg := new_zg
+                                            gg := math.max(gg, s_ext.hi)
+                                            dd := math.min(dd, s_ext.lo)
+                                            end_feat_idx := j
+                                        else
+                                            break
+                                    else
+                                        break
+
+                            int begin_bi = array.get(feat_bis, start_idx)
+                            int end_bi = array.get(feat_bis, end_feat_idx)
+                            int bi_in = begin_bi > 0 ? begin_bi - 1 : na
+                            int bi_out = end_bi + 1 < stroke_cnt ? end_bi + 1 : na
+
+                            first_s = array.get(g_strokes, begin_bi)
+                            last_s = array.get(g_strokes, end_bi)
+
+                            box bx = na
+                            if show_zs
+                                bx := box.new(first_s.time_start, zg, last_s.time_end, zd,
+                                     xloc = xloc.bar_time,
+                                     bgcolor = color_zs_bg,
+                                     border_color = color_zs_border,
+                                     border_width = 1)
+
+                            new_pv = Pivot.new(
+                                 array.size(g_pivots),
+                                 zg, zd, gg, dd,
+                                 begin_bi, end_bi,
+                                 bi_in, bi_out,
+                                 seg.idx,
+                                 first_s.time_start,
+                                 last_s.time_end,
+                                 not na(bi_out),
+                                 bx)
+
+                            array.push(g_pivots, new_pv)
+                            start_idx := end_feat_idx + 1
+                        else
+                            start_idx := start_idx + 1
+
+    else if stroke_cnt >= 3
+        // 简化中枢算法（基于连续笔）
+        int i = 0
+        while i <= stroke_cnt - 3
+            s1 = array.get(g_strokes, i)
+            s2 = array.get(g_strokes, i + 1)
+            s3 = array.get(g_strokes, i + 2)
+
+            float zd = math.max(s1.lo, math.max(s2.lo, s3.lo))
+            float zg = math.min(s1.hi, math.min(s2.hi, s3.hi))
+
+            if zd < zg
+                float gg = math.max(s1.hi, math.max(s2.hi, s3.hi))
+                float dd = math.min(s1.lo, math.min(s2.lo, s3.lo))
+                int end_idx = i + 2
+
+                // 尝试延伸
+                if i + 3 < stroke_cnt
+                    for j = i + 3 to stroke_cnt - 1
+                        s = array.get(g_strokes, j)
+                        if has_overlap(zd, zg, s.lo, s.hi)
+                            float new_zd = math.max(zd, s.lo)
+                            float new_zg = math.min(zg, s.hi)
+                            if new_zd < new_zg
+                                zd := new_zd
+                                zg := new_zg
+                                gg := math.max(gg, s.hi)
+                                dd := math.min(dd, s.lo)
+                                end_idx := j
+                            else
+                                break
+                        else
+                            break
+
+                int bi_in = i > 0 ? i - 1 : na
+                int bi_out = end_idx + 1 < stroke_cnt ? end_idx + 1 : na
+                int seg_idx = s1.seg_idx
+
+                box bx = na
+                if show_zs
+                    end_s = array.get(g_strokes, end_idx)
+                    bx := box.new(s1.time_start, zg, end_s.time_end, zd,
+                         xloc = xloc.bar_time,
+                         bgcolor = color_zs_bg,
+                         border_color = color_zs_border,
+                         border_width = 1)
+
+                end_s = array.get(g_strokes, end_idx)
+                new_pv = Pivot.new(
+                     array.size(g_pivots),
+                     zg, zd, gg, dd,
+                     i, end_idx,
+                     bi_in, bi_out,
+                     seg_idx,
+                     s1.time_start,
+                     end_s.time_end,
+                     not na(bi_out),
+                     bx)
+
+                array.push(g_pivots, new_pv)
+                i := end_idx + 1
+            else
+                i := i + 1
+
+    // ==================== 中枢合并 ====================
+    if zs_need_combine and array.size(g_pivots) >= 2
+        int pv_idx = 0
+        while pv_idx < array.size(g_pivots) - 1
+            pv1 = array.get(g_pivots, pv_idx)
+            pv2 = array.get(g_pivots, pv_idx + 1)
+
+            bool same_seg = pv1.seg_idx == pv2.seg_idx or pv1.seg_idx == -1 or pv2.seg_idx == -1
+            bool has_zs_overlap = false
+
+            if zs_combine_mode == 'zs'
+                has_zs_overlap := has_overlap(pv1.zd, pv1.zg, pv2.zd, pv2.zg)
+            else
+                has_zs_overlap := has_overlap(pv1.dd, pv1.gg, pv2.dd, pv2.gg)
+
+            if same_seg and has_zs_overlap
+                // 合并中枢
+                if zs_combine_mode == 'zs'
+                    pv1.zd := math.min(pv1.zd, pv2.zd)
+                    pv1.zg := math.max(pv1.zg, pv2.zg)
+                else
+                    pv1.zd := math.min(pv1.dd, pv2.dd)
+                    pv1.zg := math.max(pv1.gg, pv2.gg)
+
+                pv1.gg := math.max(pv1.gg, pv2.gg)
+                pv1.dd := math.min(pv1.dd, pv2.dd)
+                pv1.end_bi_idx := pv2.end_bi_idx
+                pv1.bi_out_idx := pv2.bi_out_idx
+                pv1.time_end := pv2.time_end
+                pv1.is_confirmed := pv2.is_confirmed
+
+                safe_del_box(pv2.bx)
+                array.remove(g_pivots, pv_idx + 1)
+
+                // 重绘合并后的中枢
+                safe_del_box(pv1.bx)
+                if show_zs
+                    begin_s = array.get(g_strokes, pv1.begin_bi_idx)
+                    end_s = array.get(g_strokes, pv1.end_bi_idx)
+                    pv1.bx := box.new(begin_s.time_start, pv1.zg, end_s.time_end, pv1.zd,
+                         xloc = xloc.bar_time,
+                         bgcolor = color_zs_bg,
+                         border_color = color_zs_border,
+                         border_width = 1)
+            else
+                pv_idx := pv_idx + 1
+
+    // ==================== 清理旧买卖点 ====================
+    if array.size(g_bspoints) > 0
+        for i = 0 to array.size(g_bspoints) - 1
+            bsp = array.get(g_bspoints, i)
+            safe_del_label(bsp.lbl)
+        array.clear(g_bspoints)
+
+    // ==================== 构建买卖点 ====================
+    if bsp_enabled
+        int pv_cnt = array.size(g_pivots)
+
+        // ========== 1. 一类买卖点 (T1) ==========
+        if is_bsp_enabled('1') and pv_cnt > 0
+            for i = 0 to pv_cnt - 1
+                pv = array.get(g_pivots, i)
+
+                if not na(pv.bi_out_idx) and not na(pv.bi_in_idx)
+                    int zs_bi_cnt = pv.end_bi_idx - pv.begin_bi_idx + 1
+                    bool multi_bi_ok = not bsp1_only_multibi_zs or zs_bi_cnt >= 3
+
+                    if multi_bi_ok and pv.bi_in_idx >= 0 and pv.bi_out_idx < stroke_cnt
+                        bi_in = array.get(g_strokes, pv.bi_in_idx)
+                        bi_out = array.get(g_strokes, pv.bi_out_idx)
+
+                        bool is_break = false
+                        bool is_buy = false
+
+                        // 向下笔突破中枢最低点 -> 买点
+                        if bi_out.direction == -1 and bi_out.lo < pv.dd
+                            is_break := true
+                            is_buy := true
+                        // 向上笔突破中枢最高点 -> 卖点
+                        else if bi_out.direction == 1 and bi_out.hi > pv.gg
+                            is_break := true
+                            is_buy := false
+
+                        if is_break
+                            float in_metric = bi_in.macd_val
+                            float out_metric = bi_out.macd_val
+                            float div_rate = out_metric > 0 and in_metric > 0 ? out_metric / in_metric : 1.0
+
+                            if div_rate <= divergence_rate
+                                float bsp_price = is_buy ? bi_out.lo : bi_out.hi
+
+                                label lbl = na
+                                if show_bsp
+                                    lbl := label.new(bi_out.time_end, bsp_price,
+                                         is_buy ? "1买" : "1卖",
+                                         xloc = xloc.bar_time,
+                                         color = is_buy ? color_buy : color_sell,
+                                         textcolor = color.white,
+                                         style = is_buy ? label.style_label_up : label.style_label_down,
+                                         size = size.small)
+
+                                new_bsp = BSPoint.new(
+                                     is_buy ? 1 : -1,
+                                     bi_out.idx, i, bsp_price,
+                                     bi_out.bar_end, bi_out.time_end,
+                                     na, div_rate, lbl)
+                                array.push(g_bspoints, new_bsp)
+
+        // ========== 2. 盘整一类买卖点 (T1P) ==========
+        if is_bsp_enabled('1p') and stroke_cnt >= 3
+            for i = 2 to stroke_cnt - 1
+                last_s = array.get(g_strokes, i)
+                pre_s = array.get(g_strokes, i - 2)
+
+                // 同方向的笔
+                if last_s.direction == pre_s.direction
+                    bool no_new_extreme = false
+                    if last_s.direction == -1
+                        no_new_extreme := last_s.lo >= pre_s.lo
+                    else
+                        no_new_extreme := last_s.hi <= pre_s.hi
+
+                    if no_new_extreme
+                        float in_metric = pre_s.macd_val
+                        float out_metric = last_s.macd_val
+                        float div_rate = out_metric > 0 and in_metric > 0 ? out_metric / in_metric : 1.0
+
+                        if div_rate <= divergence_rate
+                            bool is_buy = last_s.direction == -1
+                            float bsp_price = is_buy ? last_s.lo : last_s.hi
+
+                            // 检查是否已存在一类买卖点
+                            bool has_t1 = false
+                            for j = 0 to array.size(g_bspoints) - 1
+                                existing = array.get(g_bspoints, j)
+                                if existing.bi_idx == i and math.abs(existing.bsp_type) == 1
+                                    has_t1 := true
+                                    break
+
+                            if not has_t1
+                                label lbl = na
+                                if show_bsp
+                                    lbl := label.new(last_s.time_end, bsp_price,
+                                         is_buy ? "1p买" : "1p卖",
+                                         xloc = xloc.bar_time,
+                                         color = is_buy ? color.new(#ff9800, 0) : color.new(#673ab7, 0),
+                                         textcolor = color.white,
+                                         style = is_buy ? label.style_label_up : label.style_label_down,
+                                         size = size.small)
+
+                                new_bsp = BSPoint.new(
+                                     is_buy ? 11 : -11,
+                                     i, na, bsp_price,
+                                     last_s.bar_end, last_s.time_end,
+                                     na, div_rate, lbl)
+                                array.push(g_bspoints, new_bsp)
+
+        // ========== 3. 二类买卖点 (T2) ==========
+        if is_bsp_enabled('2') and bsp2_follow_1
+            int bsp1_cnt = array.size(g_bspoints)
+            for i = 0 to bsp1_cnt - 1
+                bsp1 = array.get(g_bspoints, i)
+
+                if math.abs(bsp1.bsp_type) == 1 or math.abs(bsp1.bsp_type) == 11
+                    int bsp2_bi_idx = bsp1.bi_idx + 2
+
+                    if bsp2_bi_idx < stroke_cnt
+                        break_s = array.get(g_strokes, bsp1.bi_idx + 1)
+                        bsp2_s = array.get(g_strokes, bsp2_bi_idx)
+
+                        bool is_buy = bsp1.bsp_type > 0
+                        bool dir_ok = (is_buy and bsp2_s.direction == -1) or (not is_buy and bsp2_s.direction == 1)
+
+                        if dir_ok
+                            float retrace = stroke_amp(bsp2_s) / stroke_amp(break_s)
+
+                            if retrace <= max_bs2_rate
+                                float bsp_price = is_buy ? bsp2_s.lo : bsp2_s.hi
+
+                                label lbl = na
+                                if show_bsp
+                                    lbl := label.new(bsp2_s.time_end, bsp_price,
+                                         is_buy ? "2买" : "2卖",
+                                         xloc = xloc.bar_time,
+                                         color = is_buy ? color.new(#ffc107, 0) : color.new(#607d8b, 0),
+                                         textcolor = color.black,
+                                         style = is_buy ? label.style_label_up : label.style_label_down,
+                                         size = size.small)
+
+                                new_bsp = BSPoint.new(
+                                     is_buy ? 2 : -2,
+                                     bsp2_bi_idx, na, bsp_price,
+                                     bsp2_s.bar_end, bsp2_s.time_end,
+                                     i, retrace, lbl)
+                                array.push(g_bspoints, new_bsp)
+
+        // ========== 4. 类二买卖点 (T2S) ==========
+        if is_bsp_enabled('2s') and bsp2_follow_1
+            int bsp_cnt = array.size(g_bspoints)
+            for i = 0 to bsp_cnt - 1
+                bsp1 = array.get(g_bspoints, i)
+
+                if math.abs(bsp1.bsp_type) == 1 or math.abs(bsp1.bsp_type) == 11
+                    bool is_buy = bsp1.bsp_type > 0
+                    int break_bi_idx = bsp1.bi_idx + 1
+
+                    if break_bi_idx < stroke_cnt
+                        break_s = array.get(g_strokes, break_bi_idx)
+
+                        // 从二类点之后继续查找
+                        int bias = 4
+                        float overlap_lo = na
+                        float overlap_hi = na
+                        bool first_check = true
+
+                        while bsp1.bi_idx + bias < stroke_cnt
+                            int bsp2s_bi_idx = bsp1.bi_idx + bias
+                            bsp2s_s = array.get(g_strokes, bsp2s_bi_idx)
+
+                            // 检查方向
+                            bool dir_ok = (is_buy and bsp2s_s.direction == -1) or (not is_buy and bsp2s_s.direction == 1)
+                            if not dir_ok
+                                break
+
+                            // 检查是否突破了break_bi的极值
+                            if is_buy and bsp2s_s.hi > break_s.hi
+                                break
+                            if not is_buy and bsp2s_s.lo < break_s.lo
+                                break
+
+                            // 检查区间重叠
+                            prev_s = array.get(g_strokes, bsp2s_bi_idx - 2)
+                            if first_check
+                                if has_overlap(prev_s.lo, prev_s.hi, bsp2s_s.lo, bsp2s_s.hi)
+                                    overlap_lo := math.max(prev_s.lo, bsp2s_s.lo)
+                                    overlap_hi := math.min(prev_s.hi, bsp2s_s.hi)
+                                    first_check := false
+                                else
+                                    break
+                            else
+                                if not has_overlap(overlap_lo, overlap_hi, bsp2s_s.lo, bsp2s_s.hi)
+                                    break
+
+                            // 检查回撤
+                            float retrace = math.abs(stroke_end_val(bsp2s_s) - stroke_end_val(break_s)) / stroke_amp(break_s)
+
+                            if retrace <= max_bs2_rate
+                                float bsp_price = is_buy ? bsp2s_s.lo : bsp2s_s.hi
+
+                                label lbl = na
+                                if show_bsp
+                                    lbl := label.new(bsp2s_s.time_end, bsp_price,
+                                         is_buy ? "2s买" : "2s卖",
+                                         xloc = xloc.bar_time,
+                                         color = is_buy ? color.new(#ffeb3b, 0) : color.new(#9e9e9e, 0),
+                                         textcolor = color.black,
+                                         style = is_buy ? label.style_label_up : label.style_label_down,
+                                         size = size.tiny)
+
+                                new_bsp = BSPoint.new(
+                                     is_buy ? 21 : -21,
+                                     bsp2s_bi_idx, na, bsp_price,
+                                     bsp2s_s.bar_end, bsp2s_s.time_end,
+                                     i, retrace, lbl)
+                                array.push(g_bspoints, new_bsp)
+
+                            bias := bias + 2
+
+        // ========== 5. 三类买卖点A (T3A) - 中枢之后 ==========
+        if is_bsp_enabled('3a') and pv_cnt > 0
+            for i = 0 to pv_cnt - 1
+                pv = array.get(g_pivots, i)
+
+                if not na(pv.bi_out_idx) and pv.bi_out_idx < stroke_cnt
+                    int bsp3_bi_idx = pv.bi_out_idx + 1
+                    if bsp3_bi_idx < stroke_cnt
+                        bi_out = array.get(g_strokes, pv.bi_out_idx)
+                        bsp3_s = array.get(g_strokes, bsp3_bi_idx)
+
+                        // 检查是否突破中枢
+                        bool is_up_break = bi_out.direction == 1 and bi_out.hi > pv.zg
+                        bool is_down_break = bi_out.direction == -1 and bi_out.lo < pv.zd
+
+                        bool not_back = false
+                        bool is_buy = false
+
+                        if is_up_break and bsp3_s.direction == -1
+                            // 向上突破后的回拉不回中枢
+                            not_back := bsp3_s.lo >= pv.zg
+                            is_buy := true
+                        else if is_down_break and bsp3_s.direction == 1
+                            // 向下突破后的回拉不回中枢
+                            not_back := bsp3_s.hi <= pv.zd
+                            is_buy := false
+
+                        if not_back
+                            float bsp_price = is_buy ? bsp3_s.lo : bsp3_s.hi
+
+                            label lbl = na
+                            if show_bsp
+                                lbl := label.new(bsp3_s.time_end, bsp_price,
+                                     is_buy ? "3买" : "3卖",
+                                     xloc = xloc.bar_time,
+                                     color = is_buy ? color.new(#8bc34a, 0) : color.new(#795548, 0),
+                                     textcolor = color.white,
+                                     style = is_buy ? label.style_label_up : label.style_label_down,
+                                     size = size.small)
+
+                            new_bsp = BSPoint.new(
+                                 is_buy ? 3 : -3,
+                                 bsp3_bi_idx, i, bsp_price,
+                                 bsp3_s.bar_end, bsp3_s.time_end,
+                                 na, na, lbl)
+                            array.push(g_bspoints, new_bsp)
+
+        // ========== 6. 三类买卖点B (T3B) - 中枢之前 ==========
+        if is_bsp_enabled('3b') and bsp3_follow_1
+            int bsp_cnt = array.size(g_bspoints)
+            for i = 0 to bsp_cnt - 1
+                bsp1 = array.get(g_bspoints, i)
+
+                if math.abs(bsp1.bsp_type) == 1 and not na(bsp1.zs_idx)
+                    pv = array.get(g_pivots, bsp1.zs_idx)
+                    bool is_buy = bsp1.bsp_type == 1
+
+                    int search_start = bsp1.bi_idx + 2
+                    bool found = false
+                    int bsp3_bi_idx = -1
+
+                    int j = search_start
+                    while j < stroke_cnt and not found
+                        s = array.get(g_strokes, j)
+
+                        if is_buy and s.direction == -1
+                            if s.lo >= pv.zg
+                                found := true
+                                bsp3_bi_idx := j
+                        else if not is_buy and s.direction == 1
+                            if s.hi <= pv.zd
+                                found := true
+                                bsp3_bi_idx := j
+
+                        j := j + 2
+
+                    if found and bsp3_bi_idx >= 0
+                        bsp3_s = array.get(g_strokes, bsp3_bi_idx)
+                        float bsp_price = is_buy ? bsp3_s.lo : bsp3_s.hi
+
+                        // 检查是否已存在三类买卖点
+                        bool exists = false
+                        for k = 0 to array.size(g_bspoints) - 1
+                            existing = array.get(g_bspoints, k)
+                            if existing.bi_idx == bsp3_bi_idx and math.abs(existing.bsp_type) == 3
+                                exists := true
+                                break
+
+                        if not exists
+                            label lbl = na
+                            if show_bsp
+                                lbl := label.new(bsp3_s.time_end, bsp_price,
+                                     is_buy ? "3买" : "3卖",
+                                     xloc = xloc.bar_time,
+                                     color = is_buy ? color.new(#8bc34a, 0) : color.new(#795548, 0),
+                                     textcolor = color.white,
+                                     style = is_buy ? label.style_label_up : label.style_label_down,
+                                     size = size.small)
+
+                            new_bsp = BSPoint.new(
+                                 is_buy ? 3 : -3,
+                                 bsp3_bi_idx, bsp1.zs_idx, bsp_price,
+                                 bsp3_s.bar_end, bsp3_s.time_end,
+                                 i, na, lbl)
+                            array.push(g_bspoints, new_bsp)
+
+    // ==================== 限制对象数量 ====================
+    while array.size(g_pivots) > 50
+        old_pv = array.shift(g_pivots)
+        safe_del_box(old_pv.bx)
+
+    while array.size(g_bspoints) > 100
+        old_bsp = array.shift(g_bspoints)
+        safe_del_label(old_bsp.lbl)
+
+// ==================== 信息面板 ====================
+plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
+
+var table info_tbl = table.new(position.top_right, 2, 14, bgcolor = color.new(#ffffff, 10), border_width = 1, border_color = color.new(#e0e0e0, 0))
+
+if barstate.islast and show_info
+    color title_bg = color.new(#f5f5f5, 0)
+    color value_bg = color.new(#ffffff, 0)
+    color title_txt = color.new(#333333, 0)
+    color value_txt = color.new(#1976d2, 0)
+
+    // 时间周期名称
+    string period_name = ""
+    if timeframe.period == "1"
+        period_name := "1分钟"
+    else if timeframe.period == "5"
+        period_name := "5分钟"
+    else if timeframe.period == "15"
+        period_name := "15分钟"
+    else if timeframe.period == "30"
+        period_name := "30分钟"
+    else if timeframe.period == "60"
+        period_name := "1小时"
+    else if timeframe.period == "240"
+        period_name := "4小时"
+    else if timeframe.period == "D"
+        period_name := "日线"
+    else if timeframe.period == "W"
+        period_name := "周线"
+    else if timeframe.period == "M"
+        period_name := "月线"
+    else
+        period_name := timeframe.period
+
+    // 趋势状态判断
+    string trend_status = "未知"
+    if array.size(g_pivots) > 0 and array.size(g_strokes) > 0
+        last_pv = array.last(g_pivots)
+        last_s = array.last(g_strokes)
+
+        if last_s.lo > last_pv.zg
+            trend_status := "上涨趋势"
+        else if last_s.hi < last_pv.zd
+            trend_status := "下跌趋势"
+        else if last_s.hi >= last_pv.zd and last_s.lo <= last_pv.zg
+            trend_status := "中枢震荡"
+        else
+            trend_status := "盘整"
+
+    int row = 0
+    table.cell(info_tbl, 0, row, "当前级别", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, period_name, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "走势状态", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, trend_status, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "合并K线", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_klines)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "分型数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_fractals)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "笔数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_strokes)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "线段数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_segments)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "中枢数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_pivots)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    table.cell(info_tbl, 0, row, "买卖点", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+    table.cell(info_tbl, 1, row, str.tostring(array.size(g_bspoints)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+    row += 1
+
+    if array.size(g_bspoints) > 0
+        last_bsp = array.last(g_bspoints)
+        string bsp_name = ""
+        if last_bsp.bsp_type == 1
+            bsp_name := "1买"
+        else if last_bsp.bsp_type == -1
+            bsp_name := "1卖"
+        else if last_bsp.bsp_type == 11
+            bsp_name := "1p买"
+        else if last_bsp.bsp_type == -11
+            bsp_name := "1p卖"
+        else if last_bsp.bsp_type == 2
+            bsp_name := "2买"
+        else if last_bsp.bsp_type == -2
+            bsp_name := "2卖"
+        else if last_bsp.bsp_type == 21
+            bsp_name := "2s买"
+        else if last_bsp.bsp_type == -21
+            bsp_name := "2s卖"
+        else if last_bsp.bsp_type == 3
+            bsp_name := "3买"
+        else if last_bsp.bsp_type == -3
+            bsp_name := "3卖"
+
+        table.cell(info_tbl, 0, row, "最近信号", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_tbl, 1, row, bsp_name, text_color = last_bsp.bsp_type > 0 ? color.green : color.red, bgcolor = value_bg, text_size = size.small)
+        row += 1
+
+        table.cell(info_tbl, 0, row, "信号价格", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_tbl, 1, row, str.tostring(math.round(last_bsp.price, 2)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+        row += 1
+
+    if array.size(g_segments) > 0
+        last_seg = array.last(g_segments)
+        string seg_dir = last_seg.direction == 1 ? "向上" : "向下"
+        table.cell(info_tbl, 0, row, "当前线段", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_tbl, 1, row, seg_dir, text_color = last_seg.direction == 1 ? color.red : color.green, bgcolor = value_bg, text_size = size.small)
+        row += 1
+
+    if array.size(g_pivots) > 0
+        last_pv = array.last(g_pivots)
+        string zs_range = str.tostring(math.round(last_pv.zd, 2)) + " - " + str.tostring(math.round(last_pv.zg, 2))
+        table.cell(info_tbl, 0, row, "当前中枢", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
+        table.cell(info_tbl, 1, row, zs_range, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+
+// ============================================================================
+// 结束
+// ============================================================================
