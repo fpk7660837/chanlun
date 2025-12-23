@@ -1,5 +1,5 @@
 //@version=6
-indicator('缠论完整系统 V3 (同级别分解)', '缠论V3', overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 500)
+indicator('缠论完整系统 V3 (同级别分解)', '缠论V3', overlay = true, max_lines_count = 500, max_labels_count = 100, max_boxes_count = 100)
 
 // ============================================================================
 // 缠论系统 V3 - 同级别分解
@@ -29,7 +29,7 @@ group_decomp = "走势分解参数"
 decomp_enabled = input.bool(true, title = '启用同级别分解', group = group_decomp)
 decomp_from_bsp1 = input.bool(true, title = '从1类买卖点开始', group = group_decomp, tooltip = '走势从最近的1买/1卖开始分解')
 decomp_show_labels = input.bool(true, title = '显示分段标签', group = group_decomp, tooltip = '在图表上显示a/b/c/A/B标签')
-decomp_show_bg = input.bool(true, title = '显示背景色带', group = group_decomp, tooltip = '用背景色区分走势类型')
+decomp_show_bg = input.bool(false, title = '显示背景色带', group = group_decomp, tooltip = '用背景色区分走势类型')
 
 group_bsp = "买卖点参数"
 bsp_enabled = input.bool(true, title = '启用买卖点', group = group_bsp)
@@ -49,14 +49,12 @@ show_bi = input.bool(true, title = '显示笔', group = group_display)
 show_seg = input.bool(false, title = '显示线段', group = group_display)
 show_zs = input.bool(true, title = '显示中枢', group = group_display)
 show_bsp = input.bool(true, title = '显示买卖点', group = group_display)
-show_info = input.bool(true, title = '显示信息面板', group = group_display)
+show_info = input.bool(false, title = '显示信息面板', group = group_display)
 collapse_info = input.bool(false, title = '收起信息面板', group = group_display)
 
 group_color = "颜色参数"
-color_bi_up = input.color(color.new(#ff5252, 0), title = '向上笔', group = group_color)
-color_bi_down = input.color(color.new(#4caf50, 0), title = '向下笔', group = group_color)
-color_seg_up = input.color(color.new(#ff9800, 0), title = '向上线段', group = group_color)
-color_seg_down = input.color(color.new(#00bcd4, 0), title = '向下线段', group = group_color)
+color_bi = input.color(color.new(#ff5252, 0), title = '笔', group = group_color)
+color_seg = input.color(color.new(#ff9800, 0), title = '线段', group = group_color)
 color_zs_bg = input.color(color.new(#2196f3, 85), title = '中枢背景', group = group_color)
 color_zs_border = input.color(color.new(#2196f3, 30), title = '中枢边框', group = group_color)
 color_trend_up_bg = input.color(color.new(#ffcdd2, 90), title = '上涨趋势背景', group = group_color)
@@ -408,7 +406,7 @@ create_stroke(Fractal fx_start, Fractal fx_end) =>
     if show_bi
         float y1 = bi_dir == 1 ? bi_lo : bi_hi
         float y2 = bi_dir == 1 ? bi_hi : bi_lo
-        ln := line.new(fx_start.bar_time, y1, fx_end.bar_time, y2, xloc = xloc.bar_time, color = bi_dir == 1 ? color_bi_up : color_bi_down, width = 2, style = line.style_dashed)
+        ln := line.new(fx_start.bar_time, y1, fx_end.bar_time, y2, xloc = xloc.bar_time, color = color_bi, width = 2, style = line.style_dashed)
     new_stroke = Stroke.new(array.size(g_strokes), bi_dir, fx_start.idx, fx_end.idx, bi_hi, bi_lo, fx_start.bar_idx, fx_end.bar_idx, fx_start.bar_time, fx_end.bar_time, false, -1, 0.0, ln)
     new_stroke.macd_val := calc_stroke_macd(new_stroke)
     new_stroke
@@ -428,8 +426,6 @@ process_stroke(Fractal new_fx) =>
                 if array.size(g_strokes) > 0
                     prev_stroke = array.last(g_strokes)
                     prev_stroke.is_confirmed := true
-                    if not na(prev_stroke.ln)
-                        line.set_style(prev_stroke.ln, line.style_solid)
                 new_stroke = create_stroke(last_fx, new_fx)
                 array.push(g_strokes, new_stroke)
         else
@@ -446,8 +442,6 @@ process_stroke(Fractal new_fx) =>
                     if array.size(g_strokes) > 0
                         prev_stroke = array.last(g_strokes)
                         prev_stroke.is_confirmed := false
-                        if not na(prev_stroke.ln)
-                            line.set_style(prev_stroke.ln, line.style_dashed)
                 array.push(g_fractals, new_fx)
                 if array.size(g_fractals) >= 2
                     prev_fx = array.get(g_fractals, array.size(g_fractals) - 2)
@@ -465,8 +459,6 @@ if barstate.islast
         last_stroke = array.last(g_strokes)
         if not last_stroke.is_confirmed
             last_stroke.is_confirmed := true
-            if not na(last_stroke.ln)
-                line.set_style(last_stroke.ln, line.style_solid)
 
     // ==================== 清理旧对象 ====================
     if array.size(g_segments) > 0
@@ -880,165 +872,22 @@ if barstate.islast
                     bg_hi := math.max(bg_hi, pv.gg)
                     bg_lo := math.min(bg_lo, pv.dd)
 
-                // 扩展一些边距
-                float price_range = bg_hi - bg_lo
-                bg_hi := bg_hi + price_range * 0.1
-                bg_lo := bg_lo - price_range * 0.1
+                // 不扩展边距，避免影响图表缩放
+                // float price_range = bg_hi - bg_lo
+                // bg_hi := bg_hi + price_range * 0.1
+                // bg_lo := bg_lo - price_range * 0.1
 
                 Stroke start_s_box = array.get(g_strokes, start_bi_idx)
                 Stroke end_s_box = array.get(g_strokes, stroke_cnt - 1)
                 box.new(start_s_box.time_start, bg_hi, end_s_box.time_end, bg_lo, xloc = xloc.bar_time, bgcolor = bg_color, border_color = color.new(color.gray, 80), border_width = 1)
 
 // ==================== 信息面板 ====================
-plot(close, title = "helper", color = color.new(color.gray, 100), linewidth = 1)
+// 信息面板功能已暂时禁用，避免影响图表显示
+// TODO: 改用label方式显示信息，避免table占用空间
 
-var table info_tbl = table.new(position.top_right, 2, collapse_info ? 6 : 18, bgcolor = color.new(#ffffff, 10), border_width = 1, border_color = color.new(#e0e0e0, 0))
-
-if barstate.islast and show_info
-    color title_bg = color.new(#f5f5f5, 0)
-    color value_bg = color.new(#ffffff, 0)
-    color title_txt = color.new(#333333, 0)
-    color value_txt = color.new(#1976d2, 0)
-
-    string period_name = ""
-    if timeframe.period == "1"
-        period_name := "1分钟"
-    else if timeframe.period == "5"
-        period_name := "5分钟"
-    else if timeframe.period == "15"
-        period_name := "15分钟"
-    else if timeframe.period == "30"
-        period_name := "30分钟"
-    else if timeframe.period == "60"
-        period_name := "1小时"
-    else if timeframe.period == "240"
-        period_name := "4小时"
-    else if timeframe.period == "D"
-        period_name := "日线"
-    else if timeframe.period == "W"
-        period_name := "周线"
-    else if timeframe.period == "M"
-        period_name := "月线"
-    else
-        period_name := timeframe.period
-
-    int row = 0
-
-    // 基础信息
-    table.cell(info_tbl, 0, row, "当前级别", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-    table.cell(info_tbl, 1, row, period_name, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-    row += 1
-
-    // 走势分解信息（收起时只显示走势类型）
-    if decomp_enabled and not na(g_decomp)
-        string type_name = ""
-        color type_color = value_txt
-        if g_decomp.trend_type == "trend_up"
-            type_name := "上涨趋势"
-            type_color := color.red
-        else if g_decomp.trend_type == "trend_down"
-            type_name := "下跌趋势"
-            type_color := color.green
-        else if g_decomp.trend_type == "range_up"
-            type_name := "向上盘整"
-            type_color := color.orange
-        else if g_decomp.trend_type == "range_down"
-            type_name := "向下盘整"
-            type_color := color.teal
-        else
-            type_name := "形成中"
-            type_color := color.gray
-
-        if not collapse_info
-            table.cell(info_tbl, 0, row, "【走势分解】", text_color = color.new(#1976d2, 0), bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, "", text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-        table.cell(info_tbl, 0, row, collapse_info ? "走势" : "走势类型", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, type_name, text_color = type_color, bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        if not collapse_info
-            table.cell(info_tbl, 0, row, "中枢数量", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, str.tostring(g_decomp.zs_count), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-            table.cell(info_tbl, 0, row, "中枢重叠", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, g_decomp.has_overlap ? "是" : "否", text_color = g_decomp.has_overlap ? color.orange : color.green, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-            table.cell(info_tbl, 0, row, "当前位置", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, g_decomp.current_seg, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-            // 背驰信息
-            if g_decomp.divergence_ratio > 0
-                string div_status = g_decomp.is_divergence ? "疑似背驰 ⚠️" : "未背驰"
-                color div_color = g_decomp.is_divergence ? color.red : color.green
-
-                table.cell(info_tbl, 0, row, "背驰状态", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-                table.cell(info_tbl, 1, row, div_status, text_color = div_color, bgcolor = value_bg, text_size = size.small)
-                row += 1
-
-                table.cell(info_tbl, 0, row, "力度比", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-                table.cell(info_tbl, 1, row, str.tostring(math.round(g_decomp.divergence_ratio, 2)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-                row += 1
-
-    if not collapse_info
-        // 分隔线
-        table.cell(info_tbl, 0, row, "═══════", text_color = color.new(#cccccc, 0), bgcolor = value_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, "═══════", text_color = color.new(#cccccc, 0), bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        // 基础信息
-        table.cell(info_tbl, 0, row, "笔数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, str.tostring(array.size(g_strokes)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        table.cell(info_tbl, 0, row, "中枢数", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, str.tostring(array.size(g_pivots)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        table.cell(info_tbl, 0, row, "买卖点", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, str.tostring(array.size(g_bspoints)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        // 分隔线
-        table.cell(info_tbl, 0, row, "═══════", text_color = color.new(#cccccc, 0), bgcolor = value_bg, text_size = size.small)
-        table.cell(info_tbl, 1, row, "═══════", text_color = color.new(#cccccc, 0), bgcolor = value_bg, text_size = size.small)
-        row += 1
-
-        // 最近买卖点
-        if array.size(g_bspoints) > 0
-            last_bsp = array.last(g_bspoints)
-            string bsp_name = ""
-            if last_bsp.bsp_type == 1
-                bsp_name := "1买"
-            else if last_bsp.bsp_type == -1
-                bsp_name := "1卖"
-            else if last_bsp.bsp_type == 2
-                bsp_name := "2买"
-            else if last_bsp.bsp_type == -2
-                bsp_name := "2卖"
-            else if last_bsp.bsp_type == 3
-                bsp_name := "3买"
-            else if last_bsp.bsp_type == -3
-                bsp_name := "3卖"
-
-            table.cell(info_tbl, 0, row, "最近信号", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, bsp_name, text_color = last_bsp.bsp_type > 0 ? color.green : color.red, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-            table.cell(info_tbl, 0, row, "信号价格", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, str.tostring(math.round(last_bsp.price, 2)), text_color = value_txt, bgcolor = value_bg, text_size = size.small)
-            row += 1
-
-        // 当前中枢
-        if array.size(g_pivots) > 0
-            last_pv = array.last(g_pivots)
-            string zs_range = str.tostring(math.round(last_pv.zd, 2)) + " - " + str.tostring(math.round(last_pv.zg, 2))
-            table.cell(info_tbl, 0, row, "最近中枢", text_color = title_txt, bgcolor = title_bg, text_size = size.small)
-            table.cell(info_tbl, 1, row, zs_range, text_color = value_txt, bgcolor = value_bg, text_size = size.small)
+// if barstate.islast and show_info
+//     table info_tbl = table.new(position.top_right, 2, collapse_info ? 6 : 18, bgcolor = color.new(#ffffff, 10), border_width = 1, border_color = color.new(#e0e0e0, 0))
+//     ... (省略详细代码)
 
 // ============================================================================
 // 结束
